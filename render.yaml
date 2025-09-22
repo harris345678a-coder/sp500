@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: evolutivo-web
+    env: python
+    buildCommand: "pip install -r requirements_evolutivo.txt"
+    startCommand: "gunicorn -k gevent -w 1 app_evolutivo:app --bind 0.0.0.0:$PORT --timeout 180 --access-logfile /dev/null --error-logfile -"
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: evolutivo-db
+          property: connectionString
+      - key: DATA_BACKEND
+        value: yahoo
+databases:
+  - name: evolutivo-db
+    plan: free
+cronJobs:
+  - name: daily-rank
+    schedule: "0 13 * * 1-5"
+    command: "python jobs/daily_rank.py"
