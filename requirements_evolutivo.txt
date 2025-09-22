@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+gunicorn
+gevent
+pandas
+numpy
+yfinance
+psycopg2-binary
+pyyaml
