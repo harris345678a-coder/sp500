@@ -7,114 +7,129 @@ import yfinance as yf
 class DataError(Exception):
     pass
 
+def _canonical_field(col: str) -> Optional[str]:
+    s = str(col).strip().lower().replace('_', ' ')
+    # señales claras para adj close
+    if 'adj close' in s or 'adjusted close' in s or s.endswith('adj close'):
+        return 'Adj Close'
+    # tomar última palabra como campo si es OHLCV
+    last = s.split()[-1]
+    if last in ('open','high','low','close','volume'):
+        return last.title() if last != 'close' else 'Close'
+    # también aceptar casos tipo 'close' en medio (raro pero defensivo)
+    if ' close' in s or s.startswith('close'):
+        return 'Close'
+    return None
+
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normaliza un DataFrame de yfinance a columnas estándar:
-    Open, High, Low, Close, Volume (y opcional Adj Close).
-    • Acepta columnas planas o MultiIndex (ticker, campo).
-    • Si no hay Close pero hay Adj Close, deriva Close de Adj Close.
-    • Si aparece alguna columna que termine en 'close', la usa como Close.
-    • Exige como mínimo 10 filas reales.
+    Normaliza a columnas: Open, High, Low, Close, Volume (y opcional Adj Close).
+    Maneja MultiIndex y columnas duplicadas por ticker colapsándolas
+    al vector con más datos válidos (sin NaN).
     """
     if df is None or df.empty:
         raise DataError("Histórico vacío")
 
-    # Si trae MultiIndex (bulk u otras variantes), selecciona la capa de campos
+    # Si MultiIndex, intentar seleccionar el nivel de campos, manteniendo un solo ticker
     if isinstance(df.columns, pd.MultiIndex):
-        # Detecta el nivel que contiene los campos OHLCV
-        field_names = {"open", "high", "low", "close", "adj close", "volume"}
+        # intenta detectar el nivel de campos OHLCV
+        fields = {'open','high','low','close','adj close','volume'}
         field_level = None
         for i in range(df.columns.nlevels):
             vals = {str(v).strip().lower() for v in df.columns.get_level_values(i)}
-            if any(v in field_names for v in vals):
+            if any(v in fields for v in vals):
                 field_level = i
                 break
-        # Si existe field_level, colapsa los otros niveles eligiendo el primer valor
         if field_level is not None:
             other_levels = [i for i in range(df.columns.nlevels) if i != field_level]
-            # Si hay múltiples etiquetas en otros niveles, se toma la primera combinación
             if other_levels:
-                # Construye slicer tomando el primer valor único de cada otro nivel
+                # elige la primera etiqueta de cada otro nivel (primer ticker, etc.)
                 slicer = tuple(pd.Index(df.columns.get_level_values(i)).unique()[0] for i in other_levels)
-                df = df.xs(slicer, axis=1, level=other_levels)
-        # Si aún queda multiindex o no detectó nivel de campos, aplanar a nombres "AAPL Close"
+                try:
+                    df = df.xs(slicer, axis=1, level=other_levels)
+                except Exception:
+                    pass
+        # si aún queda MultiIndex, aplanar
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [' '.join(map(str, c)).strip() for c in df.columns.to_list()]
 
-    # Si existe columna 'Date', úsala como índice temporal
+    # Si existe columna 'Date', úsala como índice
     if 'Date' in df.columns:
         df = df.set_index('Date')
 
-    # Renombrado canónico
-    rename_map = {}
-    for col in list(df.columns):
-        cl = str(col).strip().lower()
-        # Casos "AAPL Close" -> toma la última palabra como campo
-        if ' ' in cl and cl.split()[-1] in ('open','high','low','close','volume'):
-            cl = cl.split()[-1]
-        if cl == 'open': rename_map[col] = 'Open'
-        elif cl == 'high': rename_map[col] = 'High'
-        elif cl == 'low': rename_map[col] = 'Low'
-        elif cl in ('close','closing'): rename_map[col] = 'Close'
-        elif cl in ('adj close','adjclose','adjusted close'): rename_map[col] = 'Adj Close'
-        elif cl == 'volume': rename_map[col] = 'Volume'
-    if rename_map:
-        df = df.rename(columns=rename_map)
+    # Construye buckets por campo canónico
+    buckets: Dict[str, List[pd.Series]] = {'Open':[], 'High':[], 'Low':[], 'Close':[], 'Volume':[], 'Adj Close':[]}
+    for col in df.columns:
+        f = _canonical_field(col)
+        if f is not None and f in buckets:
+            s = df[col]
+            # Si llega como DataFrame por duplicado de nombre, convierte a serie con la primera columna
+            if isinstance(s, pd.DataFrame):
+                # elegir la subcolumna con más datos
+                counts = s.count()
+                best = counts.idxmax()
+                s = s[best]
+            buckets[f].append(pd.to_numeric(s, errors='coerce'))
 
-    # Deriva Close si falta
-    if 'Close' not in df.columns:
-        if 'Adj Close' in df.columns:
-            df['Close'] = df['Adj Close']
+    # Selecciona la mejor serie por campo (más valores no nulos)
+    out_cols: Dict[str, pd.Series] = {}
+    for f, arr in buckets.items():
+        if not arr:
+            continue
+        if len(arr) == 1:
+            out_cols[f] = arr[0]
         else:
-            # Último recurso: columna que termine con 'close'
-            maybe = [c for c in df.columns if str(c).strip().lower().endswith('close')]
-            if maybe:
-                df['Close'] = pd.to_numeric(df[maybe[0]], errors='coerce')
+            counts = [a.count() for a in arr]
+            best_idx = int(np.argmax(counts))
+            out_cols[f] = arr[best_idx]
+
+    # Si falta Close, pero hay Adj Close, deriva Close
+    if 'Close' not in out_cols or out_cols.get('Close') is None:
+        if 'Adj Close' in out_cols:
+            out_cols['Close'] = out_cols['Adj Close'].copy()
+        else:
+            # último recurso: buscar cualquier columna original que termine en close
+            close_like = [c for c in df.columns if str(c).strip().lower().endswith('close')]
+            if close_like:
+                out_cols['Close'] = pd.to_numeric(df[close_like[0]], errors='coerce')
             else:
                 raise DataError("No hay Close ni Adj Close")
 
-    # Tipos numéricos y limpieza mínima
-    for c in ['Open','High','Low','Close','Adj Close','Volume']:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-    df = df.dropna(subset=['Open','High','Low','Close'])
-    if df.shape[0] < 10:
+    # Construye el DataFrame final en el orden deseado
+    cols_order = ['Open','High','Low','Close','Volume','Adj Close']
+    out = pd.DataFrame({k: v for k, v in out_cols.items() if k in cols_order})
+    # Limpieza mínima
+    for c in ['Open','High','Low','Close']:
+        if c not in out.columns:
+            raise DataError(f"Falta columna {c}")
+    out = out.dropna(subset=['Open','High','Low','Close'])
+    if out.shape[0] < 10:
         raise DataError("Muy pocos datos")
 
-    # Asegura índice datetime ordenado
-    if not isinstance(df.index, pd.DatetimeIndex):
+    # Índice datetime ordenado
+    if not isinstance(out.index, pd.DatetimeIndex):
         try:
-            df.index = pd.to_datetime(df.index, utc=False)
+            out.index = pd.to_datetime(out.index, utc=False)
         except Exception:
             pass
-    df = df.sort_index()
-    return df
+    out = out.sort_index()
+    return out
 
 class YahooBackend:
-    """
-    Backend de datos para ACCIONES/ETFs (no cripto).
-    - history(symbol, interval, start, end) -> DataFrame con columnas: Open, High, Low, Close, Volume
-    - history_bulk(symbols, interval, start, end) -> dict[symbol] = DataFrame
-    - order_book(symbol) -> None (Yahoo no provee Book). IBKR lo cubriría.
-    """
+    """Backend de datos para ACCIONES/ETFs."""
     def history(self, symbol: str, interval: str, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
-        # Intento principal
         df = yf.download(symbol, start=start, end=end, interval=interval,
                          progress=False, auto_adjust=False, group_by=None, threads=False)
         try:
             return _normalize_ohlcv(df)
         except DataError:
-            # Fallback quirúrgico: 60m -> 1h (naming alterno de yfinance)
             if interval == '60m':
                 df2 = yf.download(symbol, start=start, end=end, interval='1h',
                                    progress=False, auto_adjust=False, group_by=None, threads=False)
                 return _normalize_ohlcv(df2)
-            # Si vino con MultiIndex raro, intenta aplanado genérico (manejado adentro)
-            # y si igual falla, re-levanta el error sin más "parches"
             raise
 
     def history_bulk(self, symbols: List[str], interval: str, start: dt.datetime, end: dt.datetime) -> Dict[str, pd.DataFrame]:
-        # Descarga en bloque; si falla un ticker, se completa con history() puntual del mismo intervalo
         syms = list(dict.fromkeys([s for s in symbols if s]))
         out: Dict[str, pd.DataFrame] = {}
         if not syms:
@@ -123,7 +138,6 @@ class YahooBackend:
         data = yf.download(' '.join(syms), start=start, end=end, interval=interval,
                            progress=False, auto_adjust=False, group_by='ticker', threads=True)
 
-        # Caso típico: MultiIndex (ticker, field)
         if isinstance(data, pd.DataFrame) and hasattr(data.columns, 'levels'):
             tickers = list(dict.fromkeys(data.columns.get_level_values(0)))
             for tk in syms:
@@ -134,22 +148,19 @@ class YahooBackend:
                     except Exception:
                         pass
 
-        # Completa los que no salieron del bulk con pedidos unitarios
+        # Completar faltantes individualmente
         missing = [s for s in syms if s not in out]
         for tk in missing:
             try:
                 out[tk] = self.history(tk, interval, start, end)
             except DataError:
                 if interval == '60m':
-                    # ÚNICO fallback permitido: 60m -> 1h
                     out[tk] = self.history(tk, '1h', start, end)
                 else:
-                    # Si tampoco sale, se omite ese ticker sin bloquear todo el job
                     continue
         return out
 
     def order_book(self, symbol: str) -> Optional[dict]:
-        # Yahoo no provee L2; esta interfaz existe para IBKR en el futuro.
         return None
 
 def make_backend():
