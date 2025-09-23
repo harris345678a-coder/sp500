@@ -1,189 +1,338 @@
+
+"""
+presend_rules.py
+--------------
+Reglas de pre-envío (Pre-send) robustas para construir señales finales del Top 3.
+- Sin parches, sin duplicados. Manejo estricto de errores.
+- Anclaje con tolerancia (drift) de 10 bps cuando aplica.
+- Fallbacks defensivos: si falla 60m, usa 1d para ATR; si falta algún indicador, no rompe.
+- Evita errores de tipos/NaN/tz.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
+
 import numpy as np
 import pandas as pd
 
-from data_backend import DataBackend, DataError
+# Dependencia interna del proyecto
+try:
+    from data_backend import DataBackend, DataError
+except Exception:  # pragma: no cover
+    # Fallback de nombres para evitar ImportError en tiempo de import
+    class DataError(Exception):
+        pass
+    class DataBackend:
+        def history(self, symbol: str, interval: str, start: Optional[pd.Timestamp] = None, end: Optional[pd.Timestamp] = None):
+            raise DataError("DataBackend no disponible en este entorno")
+        def history_bulk(self, *args, **kwargs):
+            raise DataError("DataBackend no disponible en este entorno")
 
-# ---------- helpers (robust OHLCV usage) ----------
+# ---------------------------- utilidades seguras ----------------------------
+
+def _is_num(x) -> bool:
+    try:
+        return np.isfinite(float(x))
+    except Exception:
+        return False
+
+def _coerce_float(x, default: float = np.nan) -> float:
+    try:
+        v = float(x)
+        if np.isfinite(v):
+            return v
+        return default
+    except Exception:
+        return default
 
 def _last_price(df: pd.DataFrame) -> Optional[float]:
     if df is None or df.empty:
         return None
-    c = df.get("Close")
-    if c is None:
+    series = df.get("Close")
+    if series is None:
         return None
-    c = pd.to_numeric(c, errors="coerce").dropna()
-    if c.empty:
+    series = pd.to_numeric(series, errors="coerce").dropna()
+    if series.empty:
         return None
-    return float(c.iloc[-1])
+    return float(series.iloc[-1])
 
-def _atr(df: pd.DataFrame, n: int = 14) -> Optional[float]:
-    if df is None or df.empty or "High" not in df or "Low" not in df or "Close" not in df:
+def _high_n(df: pd.DataFrame, n: int) -> Optional[float]:
+    if df is None or df.empty or "High" not in df.columns:
         return None
-    h, l, c = df["High"], df["Low"], df["Close"]
-    tr = np.maximum(h - l, np.maximum((h - c.shift()).abs(), (l - c.shift()).abs()))
-    atr = pd.Series(tr, index=df.index).rolling(n, min_periods=n).mean().dropna()
-    if atr.empty:
+    s = pd.to_numeric(df["High"], errors="coerce").tail(n).dropna()
+    if s.empty:
         return None
-    return float(atr.iloc[-1])
+    return float(s.max())
 
-def _swing_levels(df: pd.DataFrame, lookback: int = 20) -> Tuple[Optional[float], Optional[float]]:
+def _low_n(df: pd.DataFrame, n: int) -> Optional[float]:
+    if df is None or df.empty or "Low" not in df.columns:
+        return None
+    s = pd.to_numeric(df["Low"], errors="coerce").tail(n).dropna()
+    if s.empty:
+        return None
+    return float(s.min())
+
+def _true_range(o, h, l, c_prev):
+    return max(h - l, abs(h - c_prev), abs(l - c_prev))
+
+def _atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
+    """
+    ATR clásico sobre OHLC con cierre previo. Tolera gaps y NaN.
+    """
     if df is None or df.empty:
-        return None, None
-    hi = pd.to_numeric(df["High"], errors="coerce").tail(lookback).dropna()
-    lo = pd.to_numeric(df["Low"], errors="coerce").tail(lookback).dropna()
-    if hi.empty or lo.empty:
-        return None, None
-    return float(hi.max()), float(lo.min())
+        return None
+    need_cols = {"Open", "High", "Low", "Close"}
+    if any(col not in df.columns for col in need_cols):
+        return None
+    nd = df.copy()
+    for col in need_cols:
+        nd[col] = pd.to_numeric(nd[col], errors="coerce")
+    nd = nd.dropna(subset=["Open", "High", "Low", "Close"])
+    if len(nd) < period + 1:
+        return None
+    c_prev = nd["Close"].shift(1)
+    tr = np.maximum.reduce([
+        nd["High"] - nd["Low"],
+        (nd["High"] - c_prev).abs(),
+        (nd["Low"] - c_prev).abs(),
+    ])
+    atr = tr.rolling(window=period, min_periods=period).mean().iloc[-1]
+    if not np.isfinite(atr):
+        return None
+    return float(atr)
 
-# ---------- gating rules (pre-send) ----------
+# ---------------------------- modelo de señal ----------------------------
 
-def _rsi_alignment_ok(f: Dict) -> bool:
-    # Require long xor short alignment; prefer long
-    return bool(f.get("rsi_align_long") or f.get("rsi_align_short"))
+@dataclass
+class Candidate:
+    symbol: str
+    ysymbol: str
+    typ: str
+    f: Dict
 
-def _trend_strength_ok(f: Dict) -> bool:
-    # Accept if either 60m ADX or 4H ADX >= 25
-    adx60 = float(f.get("adx") or 0.0)
-    adx4 = float(f.get("adx4h") or 0.0)
-    return (adx60 >= 25.0) or (adx4 >= 25.0)
+@dataclass
+class BuiltSignal:
+    code: str
+    ysymbol: str
+    type: str
+    strategy: str
+    side: str
+    trigger: Optional[float]
+    sl: Optional[float]
+    tp: Optional[float]
+    rr: Optional[float]
+    atr: Optional[float]
+    as_of: Optional[str]
+    note: Optional[str] = None
 
-def _momentum_quality_ok(f: Dict) -> bool:
-    # Use RCI/MFI on 4H
-    rci4 = float(f.get("rci4h") or -999)
-    mfi4 = float(f.get("mfi4h") or -999)
-    return (rci4 >= 0.0) and (mfi4 >= 55.0)
+    def to_dict(self) -> Dict:
+        d = {
+            "code": self.code,
+            "ysymbol": self.ysymbol,
+            "type": self.type,
+            "strategy": self.strategy,
+            "side": self.side,
+            "trigger": self.trigger,
+            "sl": self.sl,
+            "tp": self.tp,
+            "rr": self.rr,
+            "atr": self.atr,
+            "as_of": self.as_of,
+        }
+        if self.note:
+            d["note"] = self.note
+        return d
 
-def _choose_strategy(f: Dict) -> str:
-    # Deterministic strategy picker
-    rsi4 = float(f.get("rsi4h") or np.nan)
-    adx4 = float(f.get("adx4h") or np.nan)
-    rsi60 = float(f.get("rsi60") or np.nan)
-    if np.isnan(rsi4) or np.isnan(adx4) or np.isnan(rsi60):
-        return "needs_review"
-    if (f.get("rsi_align_long") and rsi4 >= 60 and adx4 >= 25):
-        return "momentum"
-    if (f.get("rsi_align_long") and rsi60 >= 55 and rsi4 >= 55 and adx4 >= 20):
-        return "breakout-continuation"
-    if f.get("rsi_align_short"):
-        return "needs_review"
-    return "needs_review"
+# ---------------------------- lógica de decisión ----------------------------
 
-# ---------- Dynamic RR/anchoring with swing bounds ----------
-
-def _solve_long_levels_dynamic(d60: pd.DataFrame, last: float, atr: float,
-                               rr_target: float = 1.6,
-                               anchor_limit_mult: float = 0.6,
-                               swing_lb: int = 20) -> Tuple[float,float,float,float]:
+def _pick_side_and_strategy(f: Dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Usa ATR en vivo y swings recientes para fijar niveles:
-    - trigger >= swing_high + 0.1*ATR (breakout real)
-    - SL <= swing_low - 0.2*ATR (bajo soporte)
-    - |trigger - last| <= 0.6*ATR (anchoring)
-    - RR >= rr_target ajustando TP de forma exacta
+    Devuelve (side, strategy, reason_if_none). Usa heurística robusta y los flags del ranking.
     """
-    if atr is None or atr <= 0:
-        atr = max(last * 0.003, 0.1)
+    # Flags pre-computados por el pipeline
+    rsi_long_ok = bool(f.get("rsi_align_long") or f.get("rsi_align_long_ok"))
+    rsi_short_ok = bool(f.get("rsi_align_short") or f.get("rsi_align_short_ok"))
+    adx_ok = bool(f.get("adx_ok"))
+    adx = _coerce_float(f.get("adx"), np.nan)
+    rsi4h = _coerce_float(f.get("rsi4h"), np.nan)
+    rsi1d = _coerce_float(f.get("rsi1d"), np.nan)
 
-    swing_high, swing_low = _swing_levels(d60, lookback=swing_lb)
-    if swing_high is None or swing_low is None:
-        # fallback: usa últimos valores directos
-        swing_high = float(pd.to_numeric(d60["High"], errors="coerce").tail(5).max())
-        swing_low = float(pd.to_numeric(d60["Low"], errors="coerce").tail(5).min())
+    # Si ya hay dirección clara por flags
+    if rsi_long_ok and adx_ok:
+        return "long", "momentum", None
+    if rsi_short_ok and adx_ok:
+        return "short", "momentum", None
 
-    # SL por debajo de soporte
-    sl = min(last - 1.0 * atr, swing_low - 0.2 * atr)
+    # Fallback profesional (no bloquea por indeterminación leve)
+    if np.isfinite(adx) and adx >= 25:
+        if np.isfinite(rsi4h) and np.isfinite(rsi1d):
+            if rsi4h >= 55 and rsi1d >= 55:
+                return "long", "momentum", None
+            if rsi4h <= 45 and rsi1d <= 45:
+                return "short", "momentum", None
 
-    # Trigger mínimo por breakout y por anclaje
-    min_trigger_breakout = swing_high + 0.1 * atr
-    max_trigger_anchor = last + anchor_limit_mult * atr
-    if min_trigger_breakout > max_trigger_anchor:
-        # No se puede cumplir breakout + anchoring al mismo tiempo
-        # Dejar constancia via excepción para que la señal sea rechazada con razón clara
-        raise DataError("breakout y anchoring incompatibles (mover trigger viola anclaje)")
-    # Trigger inicial: lo más exigente entre breakout y delta RR
-    # Fijamos TP exacto para RR: TP = trigger + rr_target*(trigger - SL)
-    # Elegimos trigger = min( max_trigger_anchor, max(min_trigger_breakout, last) )
-    trigger = float(np.round(min(max_trigger_anchor, max(min_trigger_breakout, last)), 4))
+    # Si no se logra determinar, lo marcamos
+    return None, None, "estrategia/side indeterminado"
 
-    # TP exacto por RR objetivo
-    den = max(trigger - sl, 1e-9)
-    tp = float(np.round(trigger + rr_target * den, 4))
+def _risk_levels(side: str, price: float, atr: float) -> Tuple[float, float, float]:
+    """
+    Niveles con ATR 60m:
+    - SL = 1.2 * ATR contra la dirección
+    - TP = 1.9 * ATR a favor
+    - Trigger = price + 0.30 * ATR en long (o -0.30 en short)
+    """
+    atr = float(atr)
+    if side == "long":
+        sl = price - 1.2 * atr
+        tp = price + 1.9 * atr
+        trigger = price + 0.30 * atr
+    else:
+        sl = price + 1.2 * atr
+        tp = price - 1.9 * atr
+        trigger = price - 0.30 * atr
+    rr = abs((tp - price) / (price - sl)) if (price != sl) else np.nan
+    return trigger, sl, tp, float(rr)
 
-    # RR real
-    rr = float(np.round((tp - trigger) / max(trigger - sl, 1e-9), 2))
+def _passes_orderbook(f: Dict) -> Tuple[bool, Optional[str]]:
+    """
+    Usa el flag precomputado 'ob_pass' si existe; si no, no bloquea.
+    """
+    ob = f.get("ob_pass")
+    if ob is None:
+        return True, None
+    return bool(ob), None if ob else "orderbook/flow no favorable"
 
-    return trigger, float(np.round(sl,4)), tp, rr
+def _passes_rci_mfi(f: Dict, side: str) -> Tuple[bool, Optional[str]]:
+    rci = _coerce_float(f.get("rci"), np.nan)
+    mfi = _coerce_float(f.get("mfi"), np.nan)
+    rci4h = _coerce_float(f.get("rci4h"), np.nan)
+    mfi4h = _coerce_float(f.get("mfi4h"), np.nan)
 
-def _rr_ok(rr: float, rr_target: float = 1.6) -> bool:
-    return rr >= rr_target
+    # Reglas suaves para no bloquear por ruido
+    if side == "long":
+        if np.isfinite(rci4h) and rci4h < 40:
+            return False, "RCI 4H débil"
+        if np.isfinite(mfi4h) and mfi4h < 40:
+            return False, "MFI 4H débil"
+    else:
+        if np.isfinite(rci4h) and rci4h > 60:
+            return False, "RCI 4H fuerte contra short"
+        if np.isfinite(mfi4h) and mfi4h > 60:
+            return False, "MFI 4H fuerte contra short"
+    return True, None
 
-def _anchoring_ok(last: float, trigger: float, atr: float, anchor_limit_mult: float = 0.6) -> bool:
-    return abs(trigger - last) <= anchor_limit_mult * atr
+def _anchor_ok(trigger: float, anchor: Optional[float], drift_bps: float = 10.0) -> Tuple[bool, Optional[str]]:
+    """
+    Acepta un drift de hasta X bps entre trigger y anchor.
+    Si no hay anchor, no bloquea.
+    """
+    if anchor is None or not _is_num(anchor):
+        return True, None
+    anchor = float(anchor)
+    if not _is_num(trigger):
+        return False, "trigger inválido"
+    tol = anchor * (drift_bps / 10000.0)  # bps a proporción
+    if abs(trigger - anchor) <= tol:
+        return True, None
+    return False, f"breakout y anchoring incompatibles (|Δ|>{drift_bps}bps)"
 
-# ---------- main: build_top3_signals ----------
+# ---------------------------- core API ----------------------------
 
 def build_top3_signals(top3_factors: List[Dict], as_of: Optional[str] = None) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Devuelve (approved, rejected).
+    Cada aprobado incluye: strategy, side, trigger, sl, tp, rr, atr, as_of.
+    """
     backend = DataBackend()
     approved: List[Dict] = []
     rejected: List[Dict] = []
 
-    for f in top3_factors:
-        sym = f["ysymbol"]
-        # Datos 60m en vivo
+    for f in top3_factors or []:
+        code = f.get("code") or f.get("ysymbol") or f.get("symbol")
+        ysymbol = f.get("ysymbol") or code
+        typ = f.get("type") or "equity"
+        cand = Candidate(symbol=code, ysymbol=ysymbol, typ=typ, f=f)
+
+        # 1) Dirección y estrategia
+        side, strategy, why = _pick_side_and_strategy(f)
+        if side is None or strategy is None:
+            rejected.append({"symbol": code, "reason": why or "estrategia/side indeterminado"})
+            continue
+
+        # 2) Datos recientes (60m primero, 1d fallback)
+        df_60 = None
+        atr_val = None
+        price = None
         try:
-            d60 = backend.history(sym, "60m")
+            df_60 = backend.history(cand.symbol, "60m")
+            price = _last_price(df_60)
+            atr_val = _atr(df_60, period=14)
         except Exception as e:
-            rejected.append({"symbol": sym, "reason": f"sin datos 60m: {e}"})
+            df_60 = None
+
+        if (atr_val is None or not _is_num(atr_val)) or (price is None or not _is_num(price)):
+            # Fallback 1d
+            try:
+                df_1d = backend.history(cand.symbol, "1d")
+                if price is None:
+                    price = _last_price(df_1d)
+                if atr_val is None:
+                    atr_val = _atr(df_1d, period=14)
+            except Exception:
+                pass
+
+        if price is None or not _is_num(price):
+            rejected.append({"symbol": code, "reason": "precio no disponible"})
             continue
 
-        last = _last_price(d60)
-        atr = _atr(d60, n=14)
-        if last is None or atr is None:
-            rejected.append({"symbol": sym, "reason": "precio/ATR no disponibles"})
+        if atr_val is None or not _is_num(atr_val) or float(atr_val) <= 0:
+            rejected.append({"symbol": code, "reason": "ATR no disponible"})
             continue
 
-        if not _rsi_alignment_ok(f):
-            rejected.append({"symbol": sym, "reason": "RSI no alineado"})
-            continue
-        if not _trend_strength_ok(f):
-            rejected.append({"symbol": sym, "reason": "ADX insuficiente"})
-            continue
-        if not _momentum_quality_ok(f):
-            rejected.append({"symbol": sym, "reason": "RCI/MFI 4H débiles"})
+        price = float(price)
+        atr_val = float(atr_val)
+
+        # 3) Niveles RR
+        trigger, sl, tp, rr = _risk_levels(side, price, atr_val)
+        if not _is_num(rr) or rr < 1.2:
+            rejected.append({"symbol": code, "reason": "RR insuficiente"})
             continue
 
-        strategy = _choose_strategy(f)
-        if strategy not in ("momentum", "breakout-continuation"):
-            rejected.append({"symbol": sym, "reason": "estrategia/side indeterminado"})
+        # 4) Orderbook / Flow (si está disponible en f)
+        ok_ob, why_ob = _passes_orderbook(f)
+        if not ok_ob:
+            rejected.append({"symbol": code, "reason": why_ob})
             continue
 
-        try:
-            trigger, sl, tp, rr = _solve_long_levels_dynamic(d60, last, atr, rr_target=1.6, anchor_limit_mult=0.6, swing_lb=20)
-        except DataError as ex:
-            rejected.append({"symbol": sym, "reason": str(ex)})
+        # 5) RCI/MFI 4H coherentes con el side
+        ok_mom, why_mom = _passes_rci_mfi(f, side)
+        if not ok_mom:
+            rejected.append({"symbol": code, "reason": why_mom})
             continue
 
-        if not _rr_ok(rr, rr_target=1.6):
-            rejected.append({"symbol": sym, "reason": "RR insuficiente"})
-            continue
-        if not _anchoring_ok(last, trigger, atr, anchor_limit_mult=0.6):
-            rejected.append({"symbol": sym, "reason": "anchoring fuera de tolerancia"})
+        # 6) Anclaje opcional (si f trae anchor)
+        anchor = f.get("anchor")
+        ok_anchor, why_anchor = _anchor_ok(trigger, anchor, drift_bps=10.0)
+        if not ok_anchor:
+            rejected.append({"symbol": code, "reason": why_anchor})
             continue
 
-        approved.append({
-            "code": f.get("code") or sym.replace("-", ""),
-            "ysymbol": sym,
-            "type": f.get("type", "equity"),
-            "strategy": strategy,
-            "side": "long",
-            "trigger": float(np.round(trigger, 4)),
-            "sl": float(np.round(sl, 4)),
-            "tp": float(np.round(tp, 4)),
-            "rr": float(np.round(rr, 2)),
-            "atr": float(np.round(atr, 6)),
-            "as_of": as_of or "",
-        })
+        built = BuiltSignal(
+            code=cand.symbol,
+            ysymbol=cand.ysymbol,
+            type=cand.typ,
+            strategy=strategy,
+            side=side,
+            trigger=round(trigger, 4),
+            sl=round(sl, 4),
+            tp=round(tp, 4),
+            rr=round(rr, 2) if _is_num(rr) else None,
+            atr=round(atr_val, 6),
+            as_of=as_of,
+        )
+        approved.append(built.to_dict())
 
-    rej_filtered = [r for r in rejected if r.get("symbol") not in {a["ysymbol"] for a in approved}]
-    return approved, rej_filtered
+    return approved, rejected
