@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from ranking import run_full_pipeline
 from db import maybe_init_db, latest_run, save_run
 
-app = FastAPI(title="Evolutivo Signal Service", version="0.3.0")
+app = FastAPI(title="Evolutivo Signal Service", version="0.3.1")
 RUN_TOKEN = os.getenv("RUN_TOKEN", "123")
 STATUS_PATH = "/mnt/data/signal_status.json"
 
@@ -30,12 +30,16 @@ def _read_status() -> dict:
 def _run_and_persist():
     _write_status({"state": "running", "started_at": time.time()})
     payload = run_full_pipeline()
+    # Guarda en DB si existe
     conn = maybe_init_db()
     if conn:
         save_run(conn, payload)
+    # Guarda en FS
     with open("/mnt/data/last_signals.json", "w") as f:
         json.dump(payload, f, indent=2)
     _write_status({"state": "done", "as_of": payload["as_of"], "finished_at": time.time()})
+
+# -------------------- Health/Status --------------------
 
 @app.get("/healthz")
 def health():
@@ -44,6 +48,8 @@ def health():
 @app.get("/signals/status")
 def signals_status():
     return _read_status()
+
+# -------------------- Main run endpoints --------------------
 
 @app.get("/signals/run-top3")
 def signals_run_top3(token: Optional[str] = Query(default=None)):
@@ -89,12 +95,13 @@ def signals_top3():
             j = json.load(f)
         return JSONResponse({"as_of": j["as_of"], "top3": j["approved_top3"]})
     except Exception:
-        return JSONResponse({"error": "No hay resultados aún. Ejecuta /signals/run-redirect?token=123"}, status_code=404)
+        return JSONResponse({"error": "No hay resultados aún. Ejecuta /rank/run-redirect?token=123"}, status_code=404)
 
 @app.get("/signals/run")
 def signals_run(token: Optional[str] = Query(default=None)):
     _check_token(token)
     payload = run_full_pipeline()
+    # persist
     conn = maybe_init_db()
     if conn:
         save_run(conn, payload)
@@ -102,18 +109,44 @@ def signals_run(token: Optional[str] = Query(default=None)):
         json.dump(payload, f, indent=2)
     return JSONResponse(payload)
 
+# -------------------- Retro-compatibilidad total /rank/* --------------------
+# Mantenemos todos los endpoints clásicos para no romper automatizaciones previas.
+
+@app.get("/rank/status")
+def old_rank_status():
+    return signals_status()
+
 @app.get("/rank/top3")
 def old_rank_top3():
-    try:
-        with open("/mnt/data/last_signals.json", "r") as f:
-            j = json.load(f)
-        return JSONResponse({"as_of": j["as_of"], "top3": j["approved_top3"]})
-    except Exception:
-        return JSONResponse({"error": "No hay resultados aún. Ejecuta /signals/run-redirect?token=123"}, status_code=404)
+    return signals_top3()
+
+@app.get("/rank/run-redirect")
+def old_rank_run_redirect(token: Optional[str] = Query(default=None)):
+    return signals_run_redirect(token)
+
+@app.get("/rank/run-top3")
+@app.get("/rank/run_top3")
+def old_rank_run_top3(token: Optional[str] = Query(default=None)):
+    return signals_run_top3(token)
+
+@app.get("/rank/run")
+def old_rank_run(token: Optional[str] = Query(default=None)):
+    return signals_run(token)
+
+# -------------------- Root --------------------
 
 @app.get("/")
 def root():
     return {
-        "message": "Usa /signals/run-redirect?token=123 para ejecutar los 26 filtros y ver el Top 3 final (Trigger, SL, TP, estrategia).",
-        "endpoints": ["/signals/run?token=123", "/signals/run-top3?token=123", "/signals/top3", "/signals/status"]
+        "message": "Usa /rank/run-redirect?token=123 para ejecutar los 26 filtros y ver el Top 3 final (Trigger, SL, TP, estrategia).",
+        "endpoints": [
+            "/rank/run?token=123",
+            "/rank/run-redirect?token=123",
+            "/rank/top3",
+            "/rank/status",
+            "/signals/run?token=123",
+            "/signals/run-redirect?token=123",
+            "/signals/top3",
+            "/signals/status"
+        ]
     }
