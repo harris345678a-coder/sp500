@@ -7,53 +7,113 @@ import numpy as np
 import yfinance as yf
 
 MIN_RR = float(__import__("os").getenv("PRESEND_MIN_RR", "1.8"))
-ANCHOR_K_ATR = float(__import__("os").getenv("ANCHOR_K_ATR", "0.0"))  # usamos 0.0 porque anclamos al precio actual
 STOP_K_ATR = float(__import__("os").getenv("STOP_K_ATR", "1.2"))
 ATR_LEN = int(__import__("os").getenv("ATR_LEN", "14"))
 
-def _atr(df: pd.DataFrame, n: int = ATR_LEN) -> float:
-    h, l, c = df["High"], df["Low"], df["Close"]
-    tr = np.maximum(h - l, np.maximum((h - c.shift()).abs(), (l - c.shift()).abs()))
-    atr = tr.rolling(n, min_periods=max(3, n//2)).mean().iloc[-1]
-    return float(atr)
+# ---------------------- Utilities ----------------------
+
+def _flatten(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = [' '.join(map(str, c)).strip() for c in df.columns]
+    return df
+
+def _canonical_field(col: str) -> Optional[str]:
+    s = str(col).strip().lower()
+    if s.endswith(' adj close') or s == 'adj close' or 'adjusted close' in s:
+        return 'Adj Close'
+    if s.endswith(' open') or s == 'open':
+        return 'Open'
+    if s.endswith(' high') or s == 'high':
+        return 'High'
+    if s.endswith(' low') or s == 'low':
+        return 'Low'
+    if s.endswith(' close') or s == 'close':
+        return 'Close'
+    if s.endswith(' volume') or s == 'volume':
+        return 'Volume'
+    return None
+
+def _select_best(series_like) -> Optional[pd.Series]:
+    """If given a DataFrame with multiple candidate columns, pick the one with most non-nulls."""
+    if isinstance(series_like, pd.Series):
+        return series_like
+    if isinstance(series_like, pd.DataFrame):
+        if series_like.shape[1] == 1:
+            return series_like.iloc[:, 0]
+        counts = series_like.notna().sum()
+        # counts is Series indexed by column; pick max
+        best_col = counts.idxmax()
+        return series_like[best_col]
+    return None
+
+def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = _flatten(df)
+
+    # Map all possible variants to canonical keys, then select best per key
+    buckets: Dict[str, list] = {'Open':[], 'High':[], 'Low':[], 'Close':[], 'Adj Close':[], 'Volume':[]}
+    for col in df.columns:
+        canon = _canonical_field(col)
+        if canon in buckets:
+            s = df[col]
+            if isinstance(s, pd.DataFrame):
+                for c in s.columns:
+                    buckets[canon].append(pd.to_numeric(s[c], errors='coerce'))
+            else:
+                buckets[canon].append(pd.to_numeric(s, errors='coerce'))
+
+    out: Dict[str, pd.Series] = {}
+    for key in ('Open','High','Low','Close','Adj Close','Volume'):
+        if buckets[key]:
+            # pick the one with most data
+            counts = [ser.notna().sum() for ser in buckets[key]]
+            best = int(np.argmax(counts))
+            out[key] = buckets[key][best]
+
+    # Fallback Close -> Adj Close
+    if 'Close' not in out or out['Close'].isna().all():
+        if 'Adj Close' in out and not out['Adj Close'].isna().all():
+            out['Close'] = out['Adj Close']
+        else:
+            return pd.DataFrame()
+
+    res = pd.DataFrame({k: v for k, v in out.items() if k in ('Open','High','Low','Close','Volume')})
+    if res.empty:
+        return res
+    # Drop rows missing core prices
+    res = res.dropna(subset=['Open','High','Low','Close'])
+    # Ensure DatetimeIndex
+    if not isinstance(res.index, pd.DatetimeIndex):
+        try:
+            res.index = pd.to_datetime(res.index, utc=False)
+        except Exception:
+            pass
+    return res.sort_index()
 
 def _yf_hist(sym: str) -> pd.DataFrame:
-    # 60m, fallback 1h
     for intr in ("60m", "1h"):
         df = yf.download(sym, period="90d", interval=intr, progress=False, auto_adjust=False, group_by=None, threads=False)
         if isinstance(df, pd.DataFrame) and not df.empty:
-            # handle multiindex "Adj Close"
-            if isinstance(df.columns, pd.MultiIndex):
-                if ("Adj Close" in df.columns.get_level_values(-1)) and ("Close" not in df.columns.get_level_values(-1)):
-                    # map Adj Close to Close for our calc
-                    try:
-                        sub = df.xs("Adj Close", axis=1, level=-1)
-                        sub.columns = ["Adj Close"] if sub.shape[1] == 1 else [f"{c} Adj Close" for c in sub.columns]
-                        # if single col, copy as Close
-                        if "Adj Close" in sub.columns:
-                            df = df.copy()
-                            df["Close"] = sub["Adj Close"]
-                    except Exception:
-                        pass
-                # flatten
-                df.columns = [' '.join(map(str, c)).strip() if isinstance(c, tuple) else str(c) for c in df.columns]
-            # Rename common variants
-            ren = {}
-            for col in list(df.columns):
-                cl = str(col).strip().lower()
-                if cl.endswith(" open"): ren[col] = "Open"
-                elif cl.endswith(" high"): ren[col] = "High"
-                elif cl.endswith(" low"): ren[col] = "Low"
-                elif cl == "adj close": ren[col] = "Adj Close"
-                elif cl == "close" or cl.endswith(" close"): ren[col] = "Close"
-                elif cl == "volume" or cl.endswith(" volume"): ren[col] = "Volume"
-            if ren:
-                df = df.rename(columns=ren)
-            for need in ("Open","High","Low","Close"):
-                if need not in df.columns:
-                    return pd.DataFrame()
-            return df.dropna(subset=["Open","High","Low","Close"])
+            nd = _normalize_ohlcv(df)
+            if not nd.empty and all(c in nd.columns for c in ("Open","High","Low","Close")):
+                return nd
     return pd.DataFrame()
+
+def _atr(df: pd.DataFrame, n: int = ATR_LEN) -> float:
+    # Ensure single Series per field
+    h = _select_best(df.get("High"))
+    l = _select_best(df.get("Low"))
+    c = _select_best(df.get("Close"))
+    if h is None or l is None or c is None:
+        return float("nan")
+    tr = np.maximum(h - l, np.maximum((h - c.shift()).abs(), (l - c.shift()).abs()))
+    atr = tr.rolling(n, min_periods=max(3, n//2)).mean().dropna()
+    return float(atr.iloc[-1]) if not atr.empty else float("nan")
+
+# ---------------------- Strategy/Sizing ----------------------
 
 def _decide_side_and_strategy(c: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     adx = c.get("adx", 0.0)
@@ -63,14 +123,12 @@ def _decide_side_and_strategy(c: Dict[str, Any]) -> Tuple[Optional[str], Optiona
     rsi60 = c.get("rsi60", 50.0)
     rsi1d = c.get("rsi1d", 50.0)
 
-    # Side
     side = None
     if c.get("rsi_align_long") or (pdi > mdi and rsi60 >= 55 and rsi1d >= 55):
         side = "long"
     elif c.get("rsi_align_short") or (mdi > pdi and rsi60 <= 45 and rsi1d <= 45):
         side = "short"
 
-    # Strategy
     strat = None
     if adx >= 25:
         if side == "long" and rsi60 >= 60 and rsi1d >= 60:
@@ -84,33 +142,30 @@ def _decide_side_and_strategy(c: Dict[str, Any]) -> Tuple[Optional[str], Optiona
             strat = "reversion-short"
     if strat is None and adx >= 20 and c.get("rci", 0.0) >= 0.9:
         strat = "momentum"
-
     return side, strat
 
 def _size_signal(side: str, price: float, atr: float, min_rr: float = MIN_RR) -> Dict[str, float]:
-    # anclamos entry = price actual
-    entry = price
+    entry = price  # anchor at last price
     if side == "long":
         stop = entry - STOP_K_ATR * atr
         target = entry + max(min_rr * (entry - stop), 1.5 * atr)
-        rr = (target - entry) / (entry - stop)
+        rr = (target - entry) / (entry - stop) if (entry - stop) > 0 else float("nan")
     else:
         stop = entry + STOP_K_ATR * atr
         target = entry - max(min_rr * (stop - entry), 1.5 * atr)
-        rr = (entry - target) / (stop - entry)
+        rr = (entry - target) / (stop - entry) if (stop - entry) > 0 else float("nan")
     return {
-        "trigger": round(entry, 4),
-        "sl": round(stop, 4),
-        "tp": round(target, 4),
-        "rr": round(rr, 2),
-        "atr": round(atr, 6),
+        "trigger": round(float(entry), 4),
+        "sl": round(float(stop), 4),
+        "tp": round(float(target), 4),
+        "rr": round(float(rr), 2) if not math.isnan(rr) else None,
+        "atr": round(float(atr), 6) if not math.isnan(atr) else None,
     }
 
+# ---------------------- Main ----------------------
+
 def build_top3_signals(top3_factors: List[Dict[str, Any]], as_of: Optional[str] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Devuelve approved_top3 (máx 3) y rejected_top3 con razones.
-    Siempre intenta devolver 3 aprobadas re-anclando y redimensionando SL/TP.
-    """
-    cands = sorted(top3_factors, key=lambda x: x.get("rank_score", 0), reverse=True)[:5]  # miramos hasta 5 por si alguna falla datos
+    cands = sorted(top3_factors, key=lambda x: x.get("rank_score", 0), reverse=True)[:5]
     approved: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
 
@@ -130,12 +185,21 @@ def build_top3_signals(top3_factors: List[Dict[str, Any]], as_of: Optional[str] 
             rejected.append({"symbol": c.get("code", sym), "reason": "datos intradía insuficientes"})
             continue
 
-        price = float(df["Close"].dropna().iloc[-1])
+        close_obj = df["Close"]
+        close_ser = _select_best(close_obj)
+        if close_ser is None or close_ser.dropna().empty:
+            rejected.append({"symbol": c.get("code", sym), "reason": "Close inválido"})
+            continue
+
+        price = float(close_ser.dropna().iloc[-1])
         atr = _atr(df)
+        if math.isnan(atr) or atr <= 0:
+            rejected.append({"symbol": c.get("code", sym), "reason": "ATR inválido"})
+            continue
 
         sized = _size_signal(side, price, atr, MIN_RR)
 
-        # Presend checks mínimos (ADX, RCI, MFI, RR)
+        # Presend checks mínimos
         if c.get("adx", 0) < 20:
             rejected.append({"symbol": c.get("code", sym), "reason": "ADX < 20"})
             continue
@@ -145,7 +209,7 @@ def build_top3_signals(top3_factors: List[Dict[str, Any]], as_of: Optional[str] 
         if c.get("mfi", 0) < 55:
             rejected.append({"symbol": c.get("code", sym), "reason": "MFI bajo"})
             continue
-        if sized["rr"] < MIN_RR:
+        if sized["rr"] is None or sized["rr"] < MIN_RR:
             rejected.append({"symbol": c.get("code", sym), "reason": f"RR {sized['rr']} < {MIN_RR}"})
             continue
 
@@ -161,12 +225,11 @@ def build_top3_signals(top3_factors: List[Dict[str, Any]], as_of: Optional[str] 
         if len(approved) == 3:
             break
 
-    # Si no llegamos a 3, agregamos los mejores rechazados como "needs_review" (nunca más de 3 total)
+    # Completar hasta 3 con 'needs_review' si fuese necesario (sin duplicados)
     i = 0
     while len(approved) < 3 and i < len(cands):
         c = cands[i]
         sym = c.get("ysymbol") or c.get("code")
-        # Evita duplicados por código
         if any(a.get("code") == c.get("code") for a in approved):
             i += 1
             continue

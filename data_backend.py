@@ -1,167 +1,119 @@
-import datetime as dt
-from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from typing import Dict, List, Optional
 
 class DataError(Exception):
     pass
 
-def _canonical_field(col: str) -> Optional[str]:
-    s = str(col).strip().lower().replace('_', ' ')
-    # señales claras para adj close
-    if 'adj close' in s or 'adjusted close' in s or s.endswith('adj close'):
-        return 'Adj Close'
-    # tomar última palabra como campo si es OHLCV
-    last = s.split()[-1]
-    if last in ('open','high','low','close','volume'):
-        return last.title() if last != 'close' else 'Close'
-    # también aceptar casos tipo 'close' en medio (raro pero defensivo)
-    if ' close' in s or s.startswith('close'):
-        return 'Close'
+_PERIOD_BY_INTERVAL = {
+    "1d": "400d",     # enough for ADV20 and EMAs
+    "60m": "90d",
+    "15m": "30d",     # Yahoo caps shorter intervals
+}
+
+def _flatten(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = [" ".join(map(str, c)).strip() for c in df.columns]
+    return df
+
+def _canonical(col: str) -> Optional[str]:
+    s = str(col).strip().lower()
+    if s.endswith(" open") or s == "open":
+        return "Open"
+    if s.endswith(" high") or s == "high":
+        return "High"
+    if s.endswith(" low") or s == "low":
+        return "Low"
+    if s.endswith(" close") or s == "close":
+        return "Close"
+    if s.endswith(" adj close") or s == "adj close" or "adjusted close" in s:
+        return "Adj Close"
+    if s.endswith(" volume") or s == "volume":
+        return "Volume"
     return None
 
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normaliza a columnas: Open, High, Low, Close, Volume (y opcional Adj Close).
-    Maneja MultiIndex y columnas duplicadas por ticker colapsándolas
-    al vector con más datos válidos (sin NaN).
-    """
     if df is None or df.empty:
-        raise DataError("Histórico vacío")
+        return pd.DataFrame()
 
-    # Si MultiIndex, intentar seleccionar el nivel de campos, manteniendo un solo ticker
-    if isinstance(df.columns, pd.MultiIndex):
-        # intenta detectar el nivel de campos OHLCV
-        fields = {'open','high','low','close','adj close','volume'}
-        field_level = None
-        for i in range(df.columns.nlevels):
-            vals = {str(v).strip().lower() for v in df.columns.get_level_values(i)}
-            if any(v in fields for v in vals):
-                field_level = i
-                break
-        if field_level is not None:
-            other_levels = [i for i in range(df.columns.nlevels) if i != field_level]
-            if other_levels:
-                # elige la primera etiqueta de cada otro nivel (primer ticker, etc.)
-                slicer = tuple(pd.Index(df.columns.get_level_values(i)).unique()[0] for i in other_levels)
-                try:
-                    df = df.xs(slicer, axis=1, level=other_levels)
-                except Exception:
-                    pass
-        # si aún queda MultiIndex, aplanar
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [' '.join(map(str, c)).strip() for c in df.columns.to_list()]
+    df = _flatten(df)
+    buckets: Dict[str, list] = {"Open":[], "High":[], "Low":[], "Close":[], "Adj Close":[], "Volume":[]}
 
-    # Si existe columna 'Date', úsala como índice
-    if 'Date' in df.columns:
-        df = df.set_index('Date')
-
-    # Construye buckets por campo canónico
-    buckets: Dict[str, List[pd.Series]] = {'Open':[], 'High':[], 'Low':[], 'Close':[], 'Volume':[], 'Adj Close':[]}
     for col in df.columns:
-        f = _canonical_field(col)
-        if f is not None and f in buckets:
-            s = df[col]
-            # Si llega como DataFrame por duplicado de nombre, convierte a serie con la primera columna
-            if isinstance(s, pd.DataFrame):
-                # elegir la subcolumna con más datos
-                counts = s.count()
-                best = counts.idxmax()
-                s = s[best]
-            buckets[f].append(pd.to_numeric(s, errors='coerce'))
-
-    # Selecciona la mejor serie por campo (más valores no nulos)
-    out_cols: Dict[str, pd.Series] = {}
-    for f, arr in buckets.items():
-        if not arr:
+        canon = _canonical(col)
+        if canon is None:
             continue
-        if len(arr) == 1:
-            out_cols[f] = arr[0]
+        s = df[col]
+        if isinstance(s, pd.DataFrame):
+            for c in s.columns:
+                buckets[canon].append(pd.to_numeric(s[c], errors="coerce"))
         else:
-            counts = [a.count() for a in arr]
-            best_idx = int(np.argmax(counts))
-            out_cols[f] = arr[best_idx]
+            buckets[canon].append(pd.to_numeric(s, errors="coerce"))
 
-    # Si falta Close, pero hay Adj Close, deriva Close
-    if 'Close' not in out_cols or out_cols.get('Close') is None:
-        if 'Adj Close' in out_cols:
-            out_cols['Close'] = out_cols['Adj Close'].copy()
+    out: Dict[str, pd.Series] = {}
+    for key in ("Open","High","Low","Close","Adj Close","Volume"):
+        if buckets[key]:
+            counts = [ser.notna().sum() for ser in buckets[key]]
+            best = int(np.argmax(counts))
+            out[key] = buckets[key][best]
+
+    # Fallback Close -> Adj Close
+    if "Close" not in out or out["Close"].isna().all():
+        if "Adj Close" in out and not out["Adj Close"].isna().all():
+            out["Close"] = out["Adj Close"]
         else:
-            # último recurso: buscar cualquier columna original que termine en close
-            close_like = [c for c in df.columns if str(c).strip().lower().endswith('close')]
-            if close_like:
-                out_cols['Close'] = pd.to_numeric(df[close_like[0]], errors='coerce')
-            else:
-                raise DataError("No hay Close ni Adj Close")
+            return pd.DataFrame()
 
-    # Construye el DataFrame final en el orden deseado
-    cols_order = ['Open','High','Low','Close','Volume','Adj Close']
-    out = pd.DataFrame({k: v for k, v in out_cols.items() if k in cols_order})
-    # Limpieza mínima
-    for c in ['Open','High','Low','Close']:
-        if c not in out.columns:
-            raise DataError(f"Falta columna {c}")
-    out = out.dropna(subset=['Open','High','Low','Close'])
-    if out.shape[0] < 10:
-        raise DataError("Muy pocos datos")
-
-    # Índice datetime ordenado
-    if not isinstance(out.index, pd.DatetimeIndex):
+    res = pd.DataFrame({k: v for k, v in out.items() if k in ("Open","High","Low","Close","Volume")})
+    res = res.dropna(subset=["Open","High","Low","Close"])
+    if res.empty:
+        return res
+    if not isinstance(res.index, pd.DatetimeIndex):
         try:
-            out.index = pd.to_datetime(out.index, utc=False)
+            res.index = pd.to_datetime(res.index, utc=False)
         except Exception:
             pass
-    out = out.sort_index()
-    return out
+    return res.sort_index()
 
-class YahooBackend:
-    """Backend de datos para ACCIONES/ETFs."""
-    def history(self, symbol: str, interval: str, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
-        df = yf.download(symbol, start=start, end=end, interval=interval,
-                         progress=False, auto_adjust=False, group_by=None, threads=False)
+class DataBackend:
+    """Yahoo Finance backend with robust normalization and 4H via resampling 60m."""
+    def __init__(self) -> None:
+        pass
+
+    def history(self, symbol: str, interval: str, start=None, end=None) -> pd.DataFrame:
+        if interval not in ("15m","60m","240m","1d"):
+            raise DataError(f"Intervalo no soportado: {interval}")
+        base_interval = "60m" if interval == "240m" else interval
+        period = _PERIOD_BY_INTERVAL.get(base_interval, "90d")
         try:
-            return _normalize_ohlcv(df)
-        except DataError:
-            if interval == '60m':
-                df2 = yf.download(symbol, start=start, end=end, interval='1h',
-                                   progress=False, auto_adjust=False, group_by=None, threads=False)
-                return _normalize_ohlcv(df2)
-            raise
+            df = yf.download(symbol, period=period, interval=base_interval, progress=False, auto_adjust=False, group_by=None, threads=False)
+        except Exception as e:
+            raise DataError(f"Descarga falló para {symbol} [{base_interval}]: {e}")
 
-    def history_bulk(self, symbols: List[str], interval: str, start: dt.datetime, end: dt.datetime) -> Dict[str, pd.DataFrame]:
-        syms = list(dict.fromkeys([s for s in symbols if s]))
+        nd = _normalize_ohlcv(df)
+        if nd.empty:
+            return nd
+
+        if interval == "240m":
+            # Resample 60m -> 4H
+            agg = {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+            nd = nd.resample("4H", label="right", closed="right").agg(agg).dropna()
+
+        return nd
+
+    def history_bulk(self, symbols: List[str], interval: str, start=None, end=None) -> Dict[str, pd.DataFrame]:
         out: Dict[str, pd.DataFrame] = {}
-        if not syms:
-            return out
-
-        data = yf.download(' '.join(syms), start=start, end=end, interval=interval,
-                           progress=False, auto_adjust=False, group_by='ticker', threads=True)
-
-        if isinstance(data, pd.DataFrame) and hasattr(data.columns, 'levels'):
-            tickers = list(dict.fromkeys(data.columns.get_level_values(0)))
-            for tk in syms:
-                if tk in tickers:
-                    sub = data[tk].copy()
-                    try:
-                        out[tk] = _normalize_ohlcv(sub)
-                    except Exception:
-                        pass
-
-        # Completar faltantes individualmente
-        missing = [s for s in syms if s not in out]
-        for tk in missing:
+        for tk in symbols:
             try:
                 out[tk] = self.history(tk, interval, start, end)
-            except DataError:
-                if interval == '60m':
-                    out[tk] = self.history(tk, '1h', start, end)
-                else:
-                    continue
+            except Exception:
+                out[tk] = pd.DataFrame()
         return out
-
-    def order_book(self, symbol: str) -> Optional[dict]:
-        return None
-
-def make_backend():
-    return YahooBackend()
