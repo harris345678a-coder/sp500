@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from ranking import run_full_pipeline
 from db import maybe_init_db, latest_run, save_run
 
-app = FastAPI(title="Evolutivo Signal Service", version="0.3.1")
+app = FastAPI(title="Evolutivo Signal Service", version="0.3.2")
 RUN_TOKEN = os.getenv("RUN_TOKEN", "123")
 STATUS_PATH = "/mnt/data/signal_status.json"
 
@@ -30,11 +30,10 @@ def _read_status() -> dict:
 def _run_and_persist():
     _write_status({"state": "running", "started_at": time.time()})
     payload = run_full_pipeline()
-    # Guarda en DB si existe
     conn = maybe_init_db()
     if conn:
         save_run(conn, payload)
-    # Guarda en FS
+    os.makedirs("/mnt/data", exist_ok=True)
     with open("/mnt/data/last_signals.json", "w") as f:
         json.dump(payload, f, indent=2)
     _write_status({"state": "done", "as_of": payload["as_of"], "finished_at": time.time()})
@@ -67,8 +66,7 @@ def signals_run_redirect(token: Optional[str] = Query(default=None)):
     _check_token(token)
     th = threading.Thread(target=_run_and_persist, daemon=True)
     th.start()
-    html = """
-    <html><head><meta charset='utf-8'><title>Ejecutando análisis…</title></head>
+    html = """    <html><head><meta charset='utf-8'><title>Ejecutando análisis…</title></head>
     <body style="font-family:Arial; padding:24px;">
       <h3>Ejecutando análisis…</h3>
       <p>Se publicarán las 3 señales aprobadas cuando terminen los 26 filtros.</p>
@@ -101,16 +99,15 @@ def signals_top3():
 def signals_run(token: Optional[str] = Query(default=None)):
     _check_token(token)
     payload = run_full_pipeline()
-    # persist
     conn = maybe_init_db()
     if conn:
         save_run(conn, payload)
+    os.makedirs("/mnt/data", exist_ok=True)
     with open("/mnt/data/last_signals.json", "w") as f:
         json.dump(payload, f, indent=2)
     return JSONResponse(payload)
 
-# -------------------- Retro-compatibilidad total /rank/* --------------------
-# Mantenemos todos los endpoints clásicos para no romper automatizaciones previas.
+# -------------------- Retro-compatibilidad /rank/* --------------------
 
 @app.get("/rank/status")
 def old_rank_status():
@@ -138,13 +135,15 @@ def old_rank_run(token: Optional[str] = Query(default=None)):
 @app.get("/")
 def root():
     return {
-        "message": "Usa /rank/run-redirect?token=123 para ejecutar los 26 filtros y ver el Top 3 final (Trigger, SL, TP, estrategia).",
+        "message": "Usa /rank/run-top3?token=123 para ejecutar los 26 filtros y ver el Top 3 final (Trigger, SL, TP, estrategia).",
         "endpoints": [
             "/rank/run?token=123",
+            "/rank/run-top3?token=123",
             "/rank/run-redirect?token=123",
             "/rank/top3",
             "/rank/status",
             "/signals/run?token=123",
+            "/signals/run-top3?token=123",
             "/signals/run-redirect?token=123",
             "/signals/top3",
             "/signals/status"
