@@ -1,54 +1,49 @@
 
-import pandas as pd
-import numpy as np
-import yfinance as yf
-from typing import Dict, List, Optional
+# data_backend.py
+# Backend de datos robusto para Yahoo Finance (yfinance)
+# - Soporta intervalos: 15m, 60m, 240m (4H), 1d
+# - Resample 4H desde 60m (sin warnings)
+# - Normalización OHLCV (maneja "Adj Close")
+# - Índices UTC, ordenados, sin duplicados
+# - Reintentos con 2 métodos (Ticker.history y yf.download)
+# - Excepciones claras (DataError) para que el pipeline pueda continuar
 
-__all__ = ["DataBackend", "DataError"]
+from __future__ import annotations
+
+import time
+from typing import Dict, Iterable, Optional
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
 
 class DataError(Exception):
     pass
 
 
-def _now_utc() -> pd.Timestamp:
-    """Return a timezone-aware UTC timestamp."""
+_SUPPORTED = {"15m", "60m", "240m", "1d"}
+
+# Límites de Yahoo por intervalo
+_PERIOD_BY_INTERVAL = {
+    "15m": "60d",   # máx para 15m
+    "60m": "730d",  # 2 años en 60m es aceptado
+    "1d":  "2y",    # suficiente para indicadores
+}
+
+
+def _utc_now() -> pd.Timestamp:
+    # seguro tz-aware
     return pd.Timestamp.now(tz="UTC")
 
 
-def _ensure_utc(ts: pd.Timestamp) -> pd.Timestamp:
-    if ts is None:
-        return _now_utc()
-    if isinstance(ts, pd.Timestamp):
-        if ts.tz is None:
-            return ts.tz_localize("UTC")
-        return ts.tz_convert("UTC")
-    # Try to parse anything else
-    t = pd.Timestamp(ts)
-    if t.tz is None:
-        return t.tz_localize("UTC")
-    return t.tz_convert("UTC")
-
-
-def _to_naive_utc(ts: pd.Timestamp):
-    uts = _ensure_utc(ts)
-    return uts.tz_convert("UTC").tz_localize(None)
-
-
 class DataBackend:
-    """Yahoo-backed OHLCV provider with normalization and 4h resampling.
+    def __init__(self, auto_adjust: bool = False, max_retries: int = 2, retry_sleep: float = 0.8):
+        self.auto_adjust = auto_adjust
+        self.max_retries = max_retries
+        self.retry_sleep = retry_sleep
 
-    Supports intervals: 15m, 60m, 240m (built from 60m), 1d.
-    Always returns a pandas.DataFrame indexed by UTC timestamps with columns:
-    Open, High, Low, Close, Volume (and Adj Close when available).
-    """
-
-    def __init__(self, cache_ttl_seconds: int = 600):
-        self.cache_ttl = pd.Timedelta(seconds=cache_ttl_seconds)
-        # cache: key -> (df, fetched_at_utc)
-        self._cache: Dict[tuple, tuple] = {}
-
-    # ---------- public API ----------
+    # API principal
     def history(
         self,
         symbol: str,
@@ -57,180 +52,227 @@ class DataBackend:
         end: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
         interval = interval.lower()
-        if interval not in {"15m", "60m", "240m", "1d"}:
+        if interval not in _SUPPORTED:
             raise DataError(f"Intervalo no soportado: {interval}")
 
-        end = _ensure_utc(end or _now_utc())
-        start = _ensure_utc(start or self._default_start(interval, end))
-
+        # 4H se construye desde 60m
         if interval == "240m":
-            # Construimos 4h desde 60m
-            base_df = self._download(symbol, "60m", start, end)
-            if base_df.empty:
-                raise DataError(f"Sin datos 60m para construir 4h en {symbol}")
-            df = self._resample_4h_from_60m(base_df)
-        else:
-            df = self._download(symbol, interval, start, end)
+            base = self.history(symbol, "60m", start=start, end=end)
+            if base.empty:
+                raise DataError(f"Sin datos base 60m para {symbol} (armar 240m)")
+            # Resample a 4 horas (label y closed a la derecha)
+            agg = {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+            # índice debe estar en UTC y ser DatetimeIndex; _normalize_ohlcv ya lo garantiza
+            out = (
+                base.resample("4h", label="right", closed="right")
+                    .agg(agg)
+                    .dropna()
+            )
+            if out.empty:
+                raise DataError(f"Resample 4h vacío para {symbol}")
+            return out
 
+        # Para 1d/60m/15m traemos directo
+        df = self._fetch_ohlcv(symbol, interval, start, end)
         return self._normalize_ohlcv(df, symbol, interval)
 
     def history_bulk(
         self,
-        symbols: List[str],
+        symbols: Iterable[str],
         interval: str,
         start: Optional[pd.Timestamp] = None,
         end: Optional[pd.Timestamp] = None,
     ) -> Dict[str, pd.DataFrame]:
         out: Dict[str, pd.DataFrame] = {}
-        for sym in symbols:
+        for s in symbols:
             try:
-                out[sym] = self.history(sym, interval, start=start, end=end)
+                out[s] = self.history(s, interval, start, end)
             except DataError:
-                # Saltamos símbolos sin datos válidos, devolvemos el resto
+                # se omite el símbolo problemático; el pipeline debe continuar
                 continue
+        if not out:
+            raise DataError(f"No se pudo obtener ningún dataset para interval={interval}")
         return out
 
-    # ---------- internals ----------
-    def _default_start(self, interval: str, end: pd.Timestamp) -> pd.Timestamp:
-        if interval == "1d":
-            delta = pd.Timedelta(days=500)
-        elif interval in {"60m", "240m"}:
-            # Límite intradía de Yahoo suele rondar 60-90 días
-            delta = pd.Timedelta(days=70)
-        elif interval == "15m":
-            delta = pd.Timedelta(days=35)
-        else:
-            delta = pd.Timedelta(days=60)
-        return end - delta
+    # ----------------- Internals -----------------
 
-    def _cache_key(self, symbol: str, interval: str, start: pd.Timestamp, end: pd.Timestamp):
-        # Redondeamos tiempos a minuto para mejorar hit-rate
-        s = _ensure_utc(start).floor("min")
-        e = _ensure_utc(end).ceil("min")
-        return (symbol.upper(), interval, s.value, e.value)
+    def _fetch_ohlcv(
+        self,
+        symbol: str,
+        interval: str,
+        start: Optional[pd.Timestamp],
+        end: Optional[pd.Timestamp],
+    ) -> pd.DataFrame:
+        """Obtiene el DataFrame bruto desde Yahoo con reintentos y 2 métodos."""
+        base_interval = "60m" if interval == "240m" else interval
 
-    def _download(self, symbol: str, interval: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-        key = self._cache_key(symbol, interval, start, end)
-        cached = self._cache.get(key)
-        now = _now_utc()
-        if cached is not None:
-            df, fetched_at = cached
-            if now - fetched_at < self.cache_ttl:
-                return df.copy()
+        # Normaliza tiempos (tz-aware -> UTC); si vienen naive, localiza en UTC
+        def _to_utc(ts: Optional[pd.Timestamp]) -> Optional[pd.Timestamp]:
+            if ts is None:
+                return None
+            if ts.tz is None:
+                return ts.tz_localize("UTC")
+            return ts.tz_convert("UTC")
 
-        yf_interval = interval if interval in {"1d", "60m", "15m"} else "60m"  # 240m usa 60m base
-        try:
-            df = yf.download(
-                tickers=symbol,
-                interval=yf_interval,
-                start=_to_naive_utc(start),
-                end=_to_naive_utc(end),
-                auto_adjust=False,
-                progress=False,
-                prepost=False,
-                threads=False,
-            )
-        except Exception as e:
-            raise DataError(f"Fallo descarga Yahoo para {symbol} {interval}: {e}")
+        start_utc = _to_utc(start)
+        end_utc = _to_utc(end) or _utc_now()
 
-        # yfinance puede devolver columnas en MultiIndex si hay varios tickers
-        if isinstance(df.columns, pd.MultiIndex):
-            df = df.droplevel(0, axis=1)
+        # Si no se pasó rango, usamos "period" recomendado por Yahoo
+        period = None
+        if start_utc is None and end_utc is not None:
+            period = _PERIOD_BY_INTERVAL.get(base_interval, "2y")
 
-        # Asegurar índice UTC
-        if not isinstance(df.index, pd.DatetimeIndex):
-            raise DataError(f"Índice no temporal en {symbol} {interval}")
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        else:
-            df.index = df.index.tz_convert("UTC")
+        # Dos estrategias: Ticker.history y yf.download
+        last_err = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                tkr = yf.Ticker(symbol)
+                if period:
+                    df = tkr.history(
+                        period=period,
+                        interval=base_interval,
+                        auto_adjust=self.auto_adjust,
+                        prepost=False,
+                        actions=False,
+                    )
+                else:
+                    df = tkr.history(
+                        start=start_utc,
+                        end=end_utc,
+                        interval=base_interval,
+                        auto_adjust=self.auto_adjust,
+                        prepost=False,
+                        actions=False,
+                    )
 
-        df = df.sort_index().copy()
-        # Guardar cache
-        self._cache[key] = (df.copy(), now)
-        return df
+                if self._looks_valid(df):
+                    return df
 
-    def _resample_4h_from_60m(self, df60: pd.DataFrame) -> pd.DataFrame:
-        # Asegurar columnas básicas antes del resample
-        needed = ["Open", "High", "Low", "Close", "Volume"]
-        cols_lower = {c.lower(): c for c in df60.columns}
-        # Subsanar mayúsculas/minúsculas
-        for n in list(df60.columns):
-            if n.lower() in {"open", "high", "low", "close", "adj close", "volume"} and n not in needed and n.title() in needed:
-                df60.rename(columns={n: n.title()}, inplace=True)
+                # Fallback 1: yf.download (suele comportarse distinto)
+                if period:
+                    df2 = yf.download(
+                        tickers=symbol,
+                        period=period,
+                        interval=base_interval,
+                        auto_adjust=self.auto_adjust,
+                        prepost=False,
+                        progress=False,
+                        group_by="column",
+                        threads=False,
+                    )
+                else:
+                    df2 = yf.download(
+                        tickers=symbol,
+                        start=start_utc,
+                        end=end_utc,
+                        interval=base_interval,
+                        auto_adjust=self.auto_adjust,
+                        prepost=False,
+                        progress=False,
+                        group_by="column",
+                        threads=False,
+                    )
 
-        # Si falta Close pero hay Adj Close, lo usamos
-        if "Close" not in df60.columns and "Adj Close" in df60.columns:
-            df60["Close"] = df60["Adj Close"]
+                if self._looks_valid(df2):
+                    return df2
 
-        agg = {
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum",
-        }
-        # Adj Close si existe, la tomamos como last
-        if "Adj Close" in df60.columns:
-            agg["Adj Close"] = "last"
+                last_err = DataError(f"Respuesta vacía/ inválida para {symbol} @ {base_interval}")
+            except Exception as e:
+                last_err = e
 
-        # Nota: usar '4h' (lowercase) para evitar FutureWarning
-        df4h = df60.resample("4h", label="right", closed="right").agg(agg)
+            if attempt < self.max_retries:
+                time.sleep(self.retry_sleep)
 
-        # Limpiar huecos
-        df4h = df4h.dropna(how="all")
-        # Si Close queda NaN en velas, quitarlas
-        if "Close" in df4h.columns:
-            df4h = df4h.dropna(subset=["Close"])
+        raise DataError(f"No se pudo descargar datos para {symbol} @ {base_interval}: {last_err}")
 
-        return df4h
-
-    def _normalize_ohlcv(self, df: pd.DataFrame, symbol: str, interval: str) -> pd.DataFrame:
+    @staticmethod
+    def _looks_valid(df: Optional[pd.DataFrame]) -> bool:
         if df is None or len(df) == 0:
-            raise DataError(f"Datos vacíos para {symbol} en {interval}")
+            return False
+        # Algunas veces Yahoo devuelve columnas en minúsculas o solo 'Adj Close'
+        cols = {c.lower() for c in df.columns}
+        needed_any = {"close"} | {"adj close"}
+        return any(k in cols for k in needed_any)
 
-        # Normalizar nombres
+    @staticmethod
+    def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+        # Flatten si viene MultiIndex (group_by="ticker")
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [" ".join([str(x) for x in tup if str(x) != ""]).strip() for tup in df.columns]
+
+        # Renombrado tolerante
         rename_map = {}
         for c in df.columns:
-            lc = c.lower()
-            if lc == "adj close":
+            cl = c.strip().lower().replace("_", " ")
+            if cl in ("open",):
+                rename_map[c] = "Open"
+            elif cl in ("high",):
+                rename_map[c] = "High"
+            elif cl in ("low",):
+                rename_map[c] = "Low"
+            elif cl in ("close", "closing price"):
+                rename_map[c] = "Close"
+            elif cl in ("adj close", "adjusted close", "adjacent close"):
                 rename_map[c] = "Adj Close"
-            elif lc in {"open", "high", "low", "close", "volume"}:
-                rename_map[c] = lc.title()
-        if rename_map:
-            df = df.rename(columns=rename_map)
+            elif cl in ("volume",):
+                rename_map[c] = "Volume"
+        df = df.rename(columns=rename_map)
 
-        # Si no hay Close pero sí Adj Close, úsala
+        # Si no hay Close pero sí Adj Close, lo usamos como Close (dato real ajustado)
         if "Close" not in df.columns and "Adj Close" in df.columns:
             df["Close"] = df["Adj Close"]
 
-        # Asegurar columnas mínimas
+        return df
+
+    def _normalize_ohlcv(self, df: pd.DataFrame, symbol: str, interval: str) -> pd.DataFrame:
+        if df is None or df.empty:
+            raise DataError(f"Sin datos para {symbol} en {interval}")
+
+        df = self._standardize_columns(df)
+
         required = ["Open", "High", "Low", "Close", "Volume"]
         missing = [c for c in required if c not in df.columns]
         if missing:
             raise DataError(f"Columnas faltantes {missing} para {symbol} en {interval}")
 
-        # Coerción numérica robusta
-        for c in required + (["Adj Close"] if "Adj Close" in df.columns else []):
-            if c in df.columns:
-                # si es Series-like, convertimos; si no, error
-                ser = df[c]
-                if not isinstance(ser, (pd.Series, pd.core.series.Series)):
-                    raise DataError(f"Columna {c} inválida para {symbol} en {interval}")
-                df[c] = pd.to_numeric(ser, errors="coerce")
-
-        # Índice UTC, único y ordenado
+        # Índice a DateTimeIndex y UTC
         if not isinstance(df.index, pd.DatetimeIndex):
-            raise DataError(f"Índice no temporal en {symbol} {interval}")
+            # intenta columnas comunes de fecha
+            for dc in ("Datetime", "Date", "date", "timestamp"):
+                if dc in df.columns:
+                    df = df.set_index(pd.to_datetime(df[dc], utc=True))
+                    break
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise DataError(f"Índice no temporal para {symbol} en {interval}")
+
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
         else:
             df.index = df.index.tz_convert("UTC")
-        df = df[~df.index.duplicated(keep="last")].sort_index()
 
-        # Remover filas sin Close
-        df = df.dropna(subset=["Close"])
+        # Mantener solo columnas requeridas
+        df = df[required].copy()
+
+        # Tipos numéricos limpios
+        for c in required:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # Elimina filas sin Close o con NaN críticos
+        df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
         if df.empty:
-            raise DataError(f"Después de normalizar no quedó Close para {symbol} en {interval}")
+            raise DataError(f"Todos los registros inválidos para {symbol} en {interval}")
+
+        # Volume NaN -> 0 (Yahoo a veces devuelve NaN intradía)
+        if df["Volume"].isna().any():
+            df["Volume"] = df["Volume"].fillna(0)
+
+        # Orden y duplicados
+        df = df[~df.index.duplicated(keep="last")].sort_index()
 
         return df
