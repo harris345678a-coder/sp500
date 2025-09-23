@@ -1,5 +1,6 @@
+import os
 import datetime as dt
-from typing import Optional
+from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -9,9 +10,10 @@ class DataError(Exception):
 
 class YahooBackend:
     """
-    Backend estricto: devuelve un DataFrame con columnas estándar
-    ['Open','High','Low','Close','Adj Close','Volume'] y al menos 30 filas.
-    Si no puede cumplirlo para un símbolo, lanza DataError.
+    Backend de datos para ACCIONES/ETFs (no cripto).
+    - history(symbol, interval, start, end) -> DataFrame con columnas: Open, High, Low, Close, Volume
+    - history_bulk(symbols, interval, start, end) -> dict[symbol] = DataFrame
+    - order_book(symbol) -> None (Yahoo no provee Book). IBKR lo cubriría.
     """
     def __init__(self):
         pass
@@ -19,68 +21,62 @@ class YahooBackend:
     def _normalize(self, df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
             raise DataError("Histórico vacío")
-
-        # Asegurar nombres de columnas con capitalización estándar
         rename_map = {}
         for col in list(df.columns):
             cl = str(col).strip().lower()
             if cl == 'open': rename_map[col] = 'Open'
             elif cl == 'high': rename_map[col] = 'High'
             elif cl == 'low': rename_map[col] = 'Low'
-            elif cl in ('close', 'closing'): rename_map[col] = 'Close'
-            elif cl in ('adj close', 'adjclose', 'adjusted close'): rename_map[col] = 'Adj Close'
+            elif cl in ('close','closing'): rename_map[col] = 'Close'
+            elif cl in ('adj close','adjclose','adjusted close'): rename_map[col] = 'Adj Close'
             elif cl == 'volume': rename_map[col] = 'Volume'
         if rename_map:
             df = df.rename(columns=rename_map)
-
-        # Si falta Close pero existe Adj Close, usamos Adj Close (datos reales)
         if 'Close' not in df.columns:
             if 'Adj Close' in df.columns:
                 df['Close'] = df['Adj Close']
             else:
-                raise DataError("No hay columna Close ni Adj Close")
-
-        # Requisitos mínimos
-        required = ['Open','High','Low','Close','Volume']
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise DataError(f"Faltan columnas: {missing}")
-
-        # Tipos numéricos y limpieza de NA
+                raise DataError("No hay Close ni Adj Close")
         for c in ['Open','High','Low','Close','Adj Close','Volume']:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
         df = df.dropna(subset=['Open','High','Low','Close'])
-
-        if df.shape[0] < 30:
-            raise DataError("Muy pocos datos (mínimo 30 días)")
-
+        if df.shape[0] < 10:
+            raise DataError("Muy pocos datos")
         return df
 
-    def history(self, ysymbol: str, start: dt.date, end: dt.date) -> pd.DataFrame:
-        # Intento 1: download (más rápido)
-        df = yf.download(
-            ysymbol, start=start, end=end,
-            interval="1d", auto_adjust=False, progress=False, group_by="column", threads=False
-        )
-        try:
-            return self._normalize(df)
-        except Exception:
-            # Intento 2: auto_adjust True
-            df2 = yf.download(
-                ysymbol, start=start, end=end,
-                interval="1d", auto_adjust=True, progress=False, group_by="column", threads=False
-            )
-            try:
-                return self._normalize(df2)
-            except Exception:
-                # Intento 3: Ticker().history
-                t = yf.Ticker(ysymbol)
-                df3 = t.history(start=start, end=end, interval="1d", auto_adjust=False)
-                df3 = df3.reset_index().set_index('Date') if 'Date' in df3.columns else df3
-                return self._normalize(df3)
+    def history(self, symbol: str, interval: str, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
+        df = yf.download(symbol, start=start, end=end, interval=interval, progress=False, auto_adjust=False, group_by=None, threads=False)
+        if isinstance(df, pd.DataFrame) and not df.empty and 'Date' in df.columns:
+            df = df.set_index('Date')
+        return self._normalize(df)
 
+    def history_bulk(self, symbols: List[str], interval: str, start: dt.datetime, end: dt.datetime) -> Dict[str, pd.DataFrame]:
+        syms = list(dict.fromkeys([s for s in symbols if s]))
+        if not syms:
+            return {}
+        data = yf.download(' '.join(syms), start=start, end=end, interval=interval,
+                           progress=False, auto_adjust=False, group_by='ticker', threads=True)
+        out = {}
+        if isinstance(data, pd.DataFrame) and hasattr(data.columns, 'levels'):
+            tickers = list(dict.fromkeys(data.columns.get_level_values(0)))
+            for tk in syms:
+                if tk in tickers:
+                    sub = data[tk].copy()
+                    try:
+                        out[tk] = self._normalize(sub)
+                    except Exception:
+                        pass
+        missing = [s for s in syms if s not in out]
+        for tk in missing:
+            try:
+                out[tk] = self.history(tk, interval, start, end)
+            except Exception:
+                pass
+        return out
+
+    def order_book(self, symbol: str) -> Optional[dict]:
+        return None
 
 def make_backend():
-    # En el futuro aquí podrías cambiar a IBKR si DATA_BACKEND=ibkr
     return YahooBackend()
