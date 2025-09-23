@@ -27,6 +27,15 @@ def _atr(df: pd.DataFrame, n: int = 14) -> Optional[float]:
         return None
     return float(atr.iloc[-1])
 
+def _swing_levels(df: pd.DataFrame, lookback: int = 20) -> Tuple[Optional[float], Optional[float]]:
+    if df is None or df.empty:
+        return None, None
+    hi = pd.to_numeric(df["High"], errors="coerce").tail(lookback).dropna()
+    lo = pd.to_numeric(df["Low"], errors="coerce").tail(lookback).dropna()
+    if hi.empty or lo.empty:
+        return None, None
+    return float(hi.max()), float(lo.min())
+
 # ---------- gating rules (pre-send) ----------
 
 def _rsi_alignment_ok(f: Dict) -> bool:
@@ -46,42 +55,71 @@ def _momentum_quality_ok(f: Dict) -> bool:
     return (rci4 >= 0.0) and (mfi4 >= 55.0)
 
 def _choose_strategy(f: Dict) -> str:
-    # Simple, deterministic strategy picker
+    # Deterministic strategy picker
     rsi4 = float(f.get("rsi4h") or np.nan)
     adx4 = float(f.get("adx4h") or np.nan)
     rsi60 = float(f.get("rsi60") or np.nan)
     if np.isnan(rsi4) or np.isnan(adx4) or np.isnan(rsi60):
         return "needs_review"
-    # Strong momentum long
     if (f.get("rsi_align_long") and rsi4 >= 60 and adx4 >= 25):
         return "momentum"
-    # Breakout continuation
     if (f.get("rsi_align_long") and rsi60 >= 55 and rsi4 >= 55 and adx4 >= 20):
         return "breakout-continuation"
-    # Potential short (not enabled here)
     if f.get("rsi_align_short"):
         return "needs_review"
     return "needs_review"
 
-# ---------- order/levels builders ----------
+# ---------- Dynamic RR/anchoring with swing bounds ----------
 
-def _levels_long_from_60m(df60: pd.DataFrame, last: float, atr: float) -> Tuple[float,float,float,float]:
-    # trigger slightly above last close; SL = last - 1.2*ATR; TP = last + 2.16*ATR  (RR ~1.8)
+def _solve_long_levels_dynamic(d60: pd.DataFrame, last: float, atr: float,
+                               rr_target: float = 1.6,
+                               anchor_limit_mult: float = 0.6,
+                               swing_lb: int = 20) -> Tuple[float,float,float,float]:
+    """
+    Usa ATR en vivo y swings recientes para fijar niveles:
+    - trigger >= swing_high + 0.1*ATR (breakout real)
+    - SL <= swing_low - 0.2*ATR (bajo soporte)
+    - |trigger - last| <= 0.6*ATR (anchoring)
+    - RR >= rr_target ajustando TP de forma exacta
+    """
     if atr is None or atr <= 0:
-        # fallback small offsets
         atr = max(last * 0.003, 0.1)
-    trigger = float(np.round(last + 0.25 * atr, 4))
-    sl = float(np.round(last - 1.2 * atr, 4))
-    tp = float(np.round(last + 2.16 * atr, 4))
-    rr = float(np.round((tp - trigger) / max(trigger - sl, 1e-6), 2))
-    return trigger, sl, tp, rr
 
-def _rr_ok(rr: float) -> bool:
-    return rr >= 1.6
+    swing_high, swing_low = _swing_levels(d60, lookback=swing_lb)
+    if swing_high is None or swing_low is None:
+        # fallback: usa últimos valores directos
+        swing_high = float(pd.to_numeric(d60["High"], errors="coerce").tail(5).max())
+        swing_low = float(pd.to_numeric(d60["Low"], errors="coerce").tail(5).min())
 
-def _anchoring_ok(last: float, trigger: float, atr: float) -> bool:
-    # Distance last->trigger must be <= 0.6*ATR
-    return abs(trigger - last) <= 0.6 * atr
+    # SL por debajo de soporte
+    sl = min(last - 1.0 * atr, swing_low - 0.2 * atr)
+
+    # Trigger mínimo por breakout y por anclaje
+    min_trigger_breakout = swing_high + 0.1 * atr
+    max_trigger_anchor = last + anchor_limit_mult * atr
+    if min_trigger_breakout > max_trigger_anchor:
+        # No se puede cumplir breakout + anchoring al mismo tiempo
+        # Dejar constancia via excepción para que la señal sea rechazada con razón clara
+        raise DataError("breakout y anchoring incompatibles (mover trigger viola anclaje)")
+    # Trigger inicial: lo más exigente entre breakout y delta RR
+    # Fijamos TP exacto para RR: TP = trigger + rr_target*(trigger - SL)
+    # Elegimos trigger = min( max_trigger_anchor, max(min_trigger_breakout, last) )
+    trigger = float(np.round(min(max_trigger_anchor, max(min_trigger_breakout, last)), 4))
+
+    # TP exacto por RR objetivo
+    den = max(trigger - sl, 1e-9)
+    tp = float(np.round(trigger + rr_target * den, 4))
+
+    # RR real
+    rr = float(np.round((tp - trigger) / max(trigger - sl, 1e-9), 2))
+
+    return trigger, float(np.round(sl,4)), tp, rr
+
+def _rr_ok(rr: float, rr_target: float = 1.6) -> bool:
+    return rr >= rr_target
+
+def _anchoring_ok(last: float, trigger: float, atr: float, anchor_limit_mult: float = 0.6) -> bool:
+    return abs(trigger - last) <= anchor_limit_mult * atr
 
 # ---------- main: build_top3_signals ----------
 
@@ -92,10 +130,11 @@ def build_top3_signals(top3_factors: List[Dict], as_of: Optional[str] = None) ->
 
     for f in top3_factors:
         sym = f["ysymbol"]
-        # Data for price/ATR from 60m (stable granularity) and 15m for fine anchor
-        d60 = backend.history(sym, "60m")
-        if d60 is None or d60.empty:
-            rejected.append({"symbol": sym, "reason": "sin datos 60m"})
+        # Datos 60m en vivo
+        try:
+            d60 = backend.history(sym, "60m")
+        except Exception as e:
+            rejected.append({"symbol": sym, "reason": f"sin datos 60m: {e}"})
             continue
 
         last = _last_price(d60)
@@ -119,13 +158,16 @@ def build_top3_signals(top3_factors: List[Dict], as_of: Optional[str] = None) ->
             rejected.append({"symbol": sym, "reason": "estrategia/side indeterminado"})
             continue
 
-        # Build levels
-        trigger, sl, tp, rr = _levels_long_from_60m(d60, last, atr)
+        try:
+            trigger, sl, tp, rr = _solve_long_levels_dynamic(d60, last, atr, rr_target=1.6, anchor_limit_mult=0.6, swing_lb=20)
+        except DataError as ex:
+            rejected.append({"symbol": sym, "reason": str(ex)})
+            continue
 
-        if not _rr_ok(rr):
+        if not _rr_ok(rr, rr_target=1.6):
             rejected.append({"symbol": sym, "reason": "RR insuficiente"})
             continue
-        if not _anchoring_ok(last, trigger, atr):
+        if not _anchoring_ok(last, trigger, atr, anchor_limit_mult=0.6):
             rejected.append({"symbol": sym, "reason": "anchoring fuera de tolerancia"})
             continue
 
@@ -143,6 +185,5 @@ def build_top3_signals(top3_factors: List[Dict], as_of: Optional[str] = None) ->
             "as_of": as_of or "",
         })
 
-    # Guarantee exclusivity: none of the approved should be in rejected
     rej_filtered = [r for r in rejected if r.get("symbol") not in {a["ysymbol"] for a in approved}]
     return approved, rej_filtered

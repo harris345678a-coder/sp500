@@ -1,119 +1,179 @@
-import pandas as pd
+from __future__ import annotations
+import os
+import time
+import threading
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, List
+
 import numpy as np
+import pandas as pd
 import yfinance as yf
-from typing import Dict, List, Optional
+
+# ---------------- Errors ----------------
 
 class DataError(Exception):
     pass
 
-_PERIOD_BY_INTERVAL = {
-    "1d": "400d",     # enough for ADV20 and EMAs
-    "60m": "90d",
-    "15m": "30d",     # Yahoo caps shorter intervals
-}
+# ---------------- Utilities ----------------
 
-def _flatten(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df = df.copy()
-        df.columns = [" ".join(map(str, c)).strip() for c in df.columns]
-    return df
+_COLS = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
 
-def _canonical(col: str) -> Optional[str]:
-    s = str(col).strip().lower()
-    if s.endswith(" open") or s == "open":
-        return "Open"
-    if s.endswith(" high") or s == "high":
-        return "High"
-    if s.endswith(" low") or s == "low":
-        return "Low"
-    if s.endswith(" close") or s == "close":
-        return "Close"
-    if s.endswith(" adj close") or s == "adj close" or "adjusted close" in s:
-        return "Adj Close"
-    if s.endswith(" volume") or s == "volume":
-        return "Volume"
-    return None
+def _to_naive_utc(ts: pd.Timestamp) -> pd.Timestamp:
+    if ts.tzinfo is None:
+        return ts
+    return ts.tz_convert("UTC").tz_localize(None)
 
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = _flatten(df)
-    buckets: Dict[str, list] = {"Open":[], "High":[], "Low":[], "Close":[], "Adj Close":[], "Volume":[]}
-
-    for col in df.columns:
-        canon = _canonical(col)
-        if canon is None:
-            continue
-        s = df[col]
-        if isinstance(s, pd.DataFrame):
-            for c in s.columns:
-                buckets[canon].append(pd.to_numeric(s[c], errors="coerce"))
-        else:
-            buckets[canon].append(pd.to_numeric(s, errors="coerce"))
-
-    out: Dict[str, pd.Series] = {}
-    for key in ("Open","High","Low","Close","Adj Close","Volume"):
-        if buckets[key]:
-            counts = [ser.notna().sum() for ser in buckets[key]]
-            best = int(np.argmax(counts))
-            out[key] = buckets[key][best]
-
-    # Fallback Close -> Adj Close
-    if "Close" not in out or out["Close"].isna().all():
-        if "Adj Close" in out and not out["Adj Close"].isna().all():
-            out["Close"] = out["Adj Close"]
-        else:
-            return pd.DataFrame()
-
-    res = pd.DataFrame({k: v for k, v in out.items() if k in ("Open","High","Low","Close","Volume")})
-    res = res.dropna(subset=["Open","High","Low","Close"])
-    if res.empty:
-        return res
-    if not isinstance(res.index, pd.DatetimeIndex):
+        raise DataError("DataFrame vacío")
+    # yfinance puede traer columnas multi-nivel (cuando se bajan varios tickers)
+    if isinstance(df.columns, pd.MultiIndex):
+        # Si es un solo símbolo, el primer nivel suele ser el nombre del campo (Open, Close, ...)
         try:
-            res.index = pd.to_datetime(res.index, utc=False)
+            df = df.copy()
+            df.columns = df.columns.get_level_values(0)
         except Exception:
-            pass
-    return res.sort_index()
+            df = df.droplevel(-1, axis=1)
+    # Asegurar columnas esperadas
+    for c in _COLS:
+        if c not in df.columns:
+            df[c] = np.nan
+    # Si falta Close, intentar Adj Close
+    if df["Close"].isna().all() and not df["Adj Close"].isna().all():
+        df["Close"] = df["Adj Close"]
+    # A numérico
+    for c in _COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    # Índice datetime y ordenado
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, utc=True)
+    else:
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+    df = df.sort_index()
+    # Validación final
+    if df["Close"].dropna().empty:
+        raise DataError("No hay Close ni Adj Close")
+    return df[["Open", "High", "Low", "Close", "Volume"]]
+
+def _resample_4h_from_60m(df60: pd.DataFrame) -> pd.DataFrame:
+    if df60 is None or df60.empty:
+        raise DataError("No hay datos 60m para resample 4H")
+    # 4H = 240m => 4 barras de 60m
+    o = df60["Open"].resample("4H").first()
+    h = df60["High"].resample("4H").max()
+    l = df60["Low"].resample("4H").min()
+    c = df60["Close"].resample("4H").last()
+    v = df60["Volume"].resample("4H").sum(min_count=1)
+    out = pd.concat([o, h, l, c, v], axis=1, keys=["Open","High","Low","Close","Volume"]).dropna(how="all")
+    out = out.dropna(subset=["Open","High","Low","Close"], how="any")
+    if out.empty:
+        raise DataError("Resample 4H vacío")
+    return out
+
+# ---------------- Backend ----------------
+
+@dataclass
+class _CacheItem:
+    df: pd.DataFrame
+    ts: float  # epoch seconds
 
 class DataBackend:
-    """Yahoo Finance backend with robust normalization and 4H via resampling 60m."""
-    def __init__(self) -> None:
-        pass
+    """
+    Backend de datos con caché TTL corta (por defecto 30s) y soporte 4H.
+    Usa yfinance como fuente OHLCV. Todos los cálculos son *en vivo* en cada llamada,
+    salvo una caché mínima para no golpear el rate limit.
+    """
 
-    def history(self, symbol: str, interval: str, start=None, end=None) -> pd.DataFrame:
-        if interval not in ("15m","60m","240m","1d"):
-            raise DataError(f"Intervalo no soportado: {interval}")
-        base_interval = "60m" if interval == "240m" else interval
-        period = _PERIOD_BY_INTERVAL.get(base_interval, "90d")
-        try:
-            df = yf.download(symbol, period=period, interval=base_interval, progress=False, auto_adjust=False, group_by=None, threads=False)
-        except Exception as e:
-            raise DataError(f"Descarga falló para {symbol} [{base_interval}]: {e}")
+    def __init__(self, ttl_seconds: int = 30):
+        self.ttl = int(ttl_seconds)
+        self._cache: Dict[Tuple[str,str], _CacheItem] = {}
+        self._lock = threading.Lock()
 
-        nd = _normalize_ohlcv(df)
-        if nd.empty:
-            return nd
+    # Ventanas por intervalo
+    _WINDOW_MAP = {
+        "1d": pd.Timedelta(days=365*2),   # 2 años para indicadores diarios
+        "60m": pd.Timedelta(days=180),    # 6 meses
+        "15m": pd.Timedelta(days=30),     # 1 mes
+    }
 
+    def _default_window(self, interval: str) -> pd.Timedelta:
         if interval == "240m":
-            # Resample 60m -> 4H
-            agg = {
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum",
-            }
-            nd = nd.resample("4H", label="right", closed="right").agg(agg).dropna()
+            return pd.Timedelta(days=90)  # 3 meses (desde 60m)
+        return self._WINDOW_MAP.get(interval, pd.Timedelta(days=90))
 
-        return nd
+    def _should_use_cache(self, key: Tuple[str,str]) -> bool:
+        item = self._cache.get(key)
+        if not item:
+            return False
+        return (time.time() - item.ts) < self.ttl
 
-    def history_bulk(self, symbols: List[str], interval: str, start=None, end=None) -> Dict[str, pd.DataFrame]:
+    def _put_cache(self, key: Tuple[str,str], df: pd.DataFrame):
+        self._cache[key] = _CacheItem(df=df.copy(), ts=time.time())
+
+    def _get_cached(self, key: Tuple[str,str]) -> Optional[pd.DataFrame]:
+        item = self._cache.get(key)
+        if not item:
+            return None
+        return item.df.copy()
+
+    def history(self, symbol: str, interval: str, start: Optional[pd.Timestamp] = None, end: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+        """Devuelve OHLCV para symbol/interval con datos vivos.
+        interval soporta: '15m', '60m', '240m', '1d'.
+        - 240m se resamplea desde 60m para mayor estabilidad.
+        - pre/post: se incluye para intradía (<=60m).
+        - TTL de caché configurable (por defecto 30s).
+        """
+        interval = interval.lower().strip()
+        key = (symbol, interval)
+
+        force_env = os.environ.get("FORCE_REFRESH", "0") == "1"
+        with self._lock:
+            if not force_env and self._should_use_cache(key):
+                cached = self._get_cached(key)
+                if cached is not None and not cached.empty:
+                    return cached
+
+        # Rango temporal
+        if end is None:
+            end = pd.Timestamp.utcnow().tz_localize("UTC")
+        if start is None:
+            start = end - self._default_window(interval)
+
+        # Fuente
+        if interval == "240m":
+            # bajar 60m y resamplear
+            base = self.history(symbol, "60m", start, end)
+            out = _resample_4h_from_60m(base)
+        else:
+            yf_interval = interval  # '15m', '60m', '1d' son válidos
+            prepost = False if yf_interval == "1d" else True
+            # yfinance requiere naive (UTC) para start/end
+            s_naive = _to_naive_utc(start)
+            e_naive = _to_naive_utc(end)
+            df = yf.download(
+                symbol,
+                start=s_naive,
+                end=e_naive,
+                interval=yf_interval,
+                auto_adjust=False,
+                prepost=prepost,
+                progress=False,
+                threads=False,
+            )
+            out = _normalize_ohlcv(df)
+
+        with self._lock:
+            self._put_cache(key, out)
+        return out
+
+    def history_bulk(self, symbols: List[str], interval: str, start: Optional[pd.Timestamp] = None, end: Optional[pd.Timestamp] = None) -> Dict[str, pd.DataFrame]:
         out: Dict[str, pd.DataFrame] = {}
-        for tk in symbols:
+        for s in symbols:
             try:
-                out[tk] = self.history(tk, interval, start, end)
+                out[s] = self.history(s, interval, start, end)
             except Exception:
-                out[tk] = pd.DataFrame()
+                out[s] = pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
         return out
