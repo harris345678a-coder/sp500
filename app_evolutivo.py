@@ -6,9 +6,15 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from ranking import run_full_pipeline
 from db import maybe_init_db, latest_run, save_run
 
-app = FastAPI(title="Evolutivo Signal Service", version="0.3.2")
+# === Writable data directory ===
+# Render Free no monta /mnt/data. Usamos /tmp por defecto (writable y efímero).
+DATA_DIR = os.getenv("DATA_DIR", "/tmp/evolutivo")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+app = FastAPI(title="Evolutivo Signal Service", version="0.3.3")
 RUN_TOKEN = os.getenv("RUN_TOKEN", "123")
-STATUS_PATH = "/mnt/data/signal_status.json"
+STATUS_PATH = os.path.join(DATA_DIR, "signal_status.json")
+LAST_JSON = os.path.join(DATA_DIR, "last_signals.json")
 
 def _check_token(token: Optional[str]) -> None:
     expected = (RUN_TOKEN or "").strip()
@@ -16,7 +22,6 @@ def _check_token(token: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Token inválido")
 
 def _write_status(d: dict):
-    os.makedirs("/mnt/data", exist_ok=True)
     with open(STATUS_PATH, "w") as f:
         json.dump(d, f)
 
@@ -33,8 +38,7 @@ def _run_and_persist():
     conn = maybe_init_db()
     if conn:
         save_run(conn, payload)
-    os.makedirs("/mnt/data", exist_ok=True)
-    with open("/mnt/data/last_signals.json", "w") as f:
+    with open(LAST_JSON, "w") as f:
         json.dump(payload, f, indent=2)
     _write_status({"state": "done", "as_of": payload["as_of"], "finished_at": time.time()})
 
@@ -42,7 +46,7 @@ def _run_and_persist():
 
 @app.get("/healthz")
 def health():
-    return {"ok": True}
+    return {"ok": True, "data_dir": DATA_DIR}
 
 @app.get("/signals/status")
 def signals_status():
@@ -55,7 +59,7 @@ def signals_run_top3(token: Optional[str] = Query(default=None)):
     _check_token(token)
     _run_and_persist()
     try:
-        with open("/mnt/data/last_signals.json", "r") as f:
+        with open(LAST_JSON, "r") as f:
             j = json.load(f)
         return JSONResponse({"as_of": j["as_of"], "top3": j["approved_top3"]})
     except Exception:
@@ -66,20 +70,21 @@ def signals_run_redirect(token: Optional[str] = Query(default=None)):
     _check_token(token)
     th = threading.Thread(target=_run_and_persist, daemon=True)
     th.start()
-    html = """    <html><head><meta charset='utf-8'><title>Ejecutando análisis…</title></head>
+    html = f"""    <html><head><meta charset='utf-8'><title>Ejecutando análisis…</title></head>
     <body style="font-family:Arial; padding:24px;">
       <h3>Ejecutando análisis…</h3>
       <p>Se publicarán las 3 señales aprobadas cuando terminen los 26 filtros.</p>
+      <p>Data dir: {DATA_DIR}</p>
       <script>
-        async function tick(){
-          try{
-            const r = await fetch('/signals/status', {cache:'no-store'});
+        async function tick(){{
+          try{{
+            const r = await fetch('/signals/status', {{cache:'no-store'}});
             const j = await r.json();
-            if(j.state==='done'){ window.location.href='/signals/top3'; return; }
-            if(j.state==='error'){ document.body.innerHTML='<h3>Error</h3><pre>'+JSON.stringify(j,null,2)+'</pre>'; return; }
-          }catch(e){}
+            if(j.state==='done'){{ window.location.href='/signals/top3'; return; }}
+            if(j.state==='error'){{ document.body.innerHTML='<h3>Error</h3><pre>'+JSON.stringify(j,null,2)+'</pre>'; return; }}
+          }}catch(e){{}}
           setTimeout(tick, 2000);
-        }
+        }}
         tick();
       </script>
     </body></html>
@@ -89,7 +94,7 @@ def signals_run_redirect(token: Optional[str] = Query(default=None)):
 @app.get("/signals/top3")
 def signals_top3():
     try:
-        with open("/mnt/data/last_signals.json", "r") as f:
+        with open(LAST_JSON, "r") as f:
             j = json.load(f)
         return JSONResponse({"as_of": j["as_of"], "top3": j["approved_top3"]})
     except Exception:
@@ -102,8 +107,7 @@ def signals_run(token: Optional[str] = Query(default=None)):
     conn = maybe_init_db()
     if conn:
         save_run(conn, payload)
-    os.makedirs("/mnt/data", exist_ok=True)
-    with open("/mnt/data/last_signals.json", "w") as f:
+    with open(LAST_JSON, "w") as f:
         json.dump(payload, f, indent=2)
     return JSONResponse(payload)
 
@@ -136,6 +140,7 @@ def old_rank_run(token: Optional[str] = Query(default=None)):
 def root():
     return {
         "message": "Usa /rank/run-top3?token=123 para ejecutar los 26 filtros y ver el Top 3 final (Trigger, SL, TP, estrategia).",
+        "data_dir": DATA_DIR,
         "endpoints": [
             "/rank/run?token=123",
             "/rank/run-top3?token=123",
