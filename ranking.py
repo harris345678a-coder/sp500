@@ -1,449 +1,512 @@
+
 # -*- coding: utf-8 -*-
 """
-ranking.py — pipeline robusto para ranking + top3.
-
-Características clave
-- Universo por defecto amplio y líquido (sin depender de CSV/URL).
-- Opcional: universo por env var (lista), CSV local o CSV remoto.
-- Descarga por lotes con yfinance.download() + fallback por símbolo con reintentos.
-- Filtros estrictos: datos suficientes, frescura, EMA20>EMA50, momentum63>0,
-  precio mínimo, liquidez por dólar-vol 20d. Sin bypass en fallback.
-- Logs de auditoría: "DATA_AUDIT | ..." por símbolo y "RESUMEN | ...".
-- API: run_full_pipeline(audit=False) -> dict compatible con app_evolutivo.
-
-Requisitos: yfinance, pandas, numpy, requests.
+ranking.py — robust market scanner with strict filters and dynamic levels.
+- Universe: ETFs/sectors/megacaps + GC=F/CL=F (no crypto). Can override with env UNIVERSE_TICKERS.
+- Data: yfinance 2y/1D; indicators: EMA20/EMA50, Momentum63, ATR14 (Wilder), ADX14, DollarVol20.
+- Filters:
+  * Liquidity (avg dollar vol 20) except for whitelisted futures (GC=F, CL=F)
+  * Trend & momentum (EMA20 vs EMA50, Momentum63)
+  * Strength (ADX >= MIN_ADX)
+  * Shorts supported simétricamente
+- Top50: relleno con "relajados" solo para completar 50 (mantienen tendencia y liquidez). Top3 siempre estricto.
+- Levels (dinámicos) con precio vivo si disponible: TG, SL, TP1, TP2 y TL (trailing start).
+- Telegram: texto plano sin parse_mode; dedupe por hash diario en /tmp para evitar spam.
+- API: run_full_pipeline(audit: bool=False, **_ignored) -> dict
 """
-from __future__ import annotations
 
-import os
-import time
-import json
-import math
+from __future__ import annotations
+import os, json, time, math, hashlib
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Tuple
 import logging
-import datetime as dt
-from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-# Dependencia principal de datos
 try:
     import yfinance as yf
-except Exception as e:
-    raise RuntimeError("Necesitas instalar yfinance") from e
+except Exception:  # pragma: no cover
+    yf = None
 
-try:
-    import requests  # sólo si se usa CSV remoto
-except Exception:
-    requests = None
-
-# ------------------------- Logging -------------------------
-
-LOG_LEVEL = os.getenv("RANKING_LOG_LEVEL", "INFO").upper()
-logger = logging.getLogger("ranking")
+# ---------------- Logging -----------------
+LOG_NAME = "ranking"
+logger = logging.getLogger(LOG_NAME)
 if not logger.handlers:
-    handler = logging.StreamHandler()
+    h = logging.StreamHandler()
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-    handler.setFormatter(fmt)
-    logger.addHandler(handler)
-logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    h.setFormatter(fmt)
+    logger.addHandler(h)
+logger.setLevel(logging.INFO)
 
-# ------------------------- Universo por defecto -------------------------
-# Universo amplio "embedded" (líquido y generalista).
-# Incluye: índices/sectores (ETFs), commodities/bonos (ETFs), mega-caps,
-# semis, energía, salud, consumo, bancos; + futuros GC=F y CL=F.
-# (Sin cripto).
-DEFAULT_UNIVERSE: List[str] = [
-    # Index/market ETFs
-    "SPY","QQQ","IWM","DIA","VTI","VOO","IVV","VTV","VOE","VUG","VGT","VHT","VFH","VNQ",
-    # Sector SPDRs
-    "XLK","XLE","XLF","XLY","XLP","XLV","XLI","XLB","XLRE","XLU","XLC",
-    # Thematic / industry ETFs
-    "SOXX","SMH","XME","GDX","GDXJ","IBB","XBI","IYR","IYT","KRE","XOP","OIH","XHB","ITB",
-    "KWEB","HACK","CIBR","TAN","URA","XRT","XAR","XTL",
-    # Commodities/Bonds ETFs
-    "GLD","SLV","DBC","DBA","USO","UNG","TLT","IEF","SHY","LQD","HYG",
-    # Megacaps / líderes liquidez
-    "AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","TSLA","AVGO","ADBE","CSCO","CRM","NFLX",
-    "AMD","INTC","QCOM","TXN","MU","AMAT","ASML",
-    "JPM","BAC","WFC","GS","MS","BLK","C",
-    "XOM","CVX","COP","SLB","EOG","PSX",
-    "UNH","JNJ","LLY","ABBV","MRK","PFE","TMO","DHR",
-    "HD","LOW","COST","WMT","TGT","NKE","SBUX","MCD","BKNG",
-    "CAT","DE","BA","GE","HON","UPS","FDX","MMM",
-    "KO","PEP","PG","CL","KHC","MDLZ",
-    "ORCL","SAP","NOW","PANW","SNOW","NET","ZS","DDOG",
-    "SHOP","SQ","PYPL","UBER","LYFT",
-    "DIS","CMCSA","T","VZ","WBD",
-    "V","MA","AXP","INTU",
-    # Futuros (solo oro y petróleo, como solicitaste)
-    "GC=F","CL=F",
-]
+def _log(tag: str, payload: Dict[str, Any]):
+    logger.info("%s | %s", tag, json.dumps(payload, ensure_ascii=False))
 
-def _dedupe_keep_order(seq: List[str]) -> List[str]:
+# ---------------- Config ------------------
+MIN_ADX = float(os.getenv("MIN_ADX", "15"))
+MIN_DOLLAR_VOL20 = float(os.getenv("MIN_DOLLAR_VOL20", "5000000"))  # $5M
+BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "55"))
+
+K_SL_ATR = float(os.getenv("K_SL_ATR", "1.0"))
+K_TP1_ATR = float(os.getenv("K_TP1_ATR", "1.0"))
+K_TP2_ATR = float(os.getenv("K_TP2_ATR", "2.0"))
+K_TL_ATR  = float(os.getenv("K_TL_ATR",  "1.0"))
+
+ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM", "true").lower() != "false"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+FUTURES_LIQ_WHITELIST = {"GC=F", "CL=F"}
+
+# ---------------- Universe ----------------
+def default_universe() -> List[str]:
+    """Universe amplio: ETFs core, sectores, temas, bonos, commodities, megacaps, semis, etc., + GC=F/CL=F."""
+    etfs_core = [
+        "SPY","QQQ","IWM","DIA","VTI","VOO","IVV","VTV","VOE","VUG","VGT","VHT","VFH",
+        "VNQ","XLC","XLK","XLY","XLP","XLV","XLI","XLB","XLRE","XLU","XLF","XLE",
+        "SOXX","SMH","XME","GDX","GDXJ","IBB","XBI","IYR","IYT","XRT","XAR","XTL",
+        "GLD","SLV","DBC","DBA","USO","UNG","TLT","IEF","SHY","LQD","HYG","URA","TAN","OIH","XHB","ITB"
+    ]
+    megacaps = [
+        "AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","TSLA","AVGO","ADBE","CSCO","CRM",
+        "NFLX","AMD","INTC","QCOM","TXN","MU","AMAT","ASML",
+        "JPM","BAC","WFC","GS","MS","BLK","C","V","MA","AXP","INTU",
+        "XOM","CVX","COP","SLB","EOG","PSX",
+        "UNH","JNJ","LLY","ABBV","MRK","PFE","TMO","DHR",
+        "HD","LOW","COST","WMT","TGT","NKE","SBUX","MCD","BKNG",
+        "CAT","DE","BA","GE","HON","UPS","FDX","MMM","ORCL","SAP",
+        "PEP","KO","PG","CL","KHC","MDLZ","DIS","CMCSA","T","VZ"
+    ]
+    growth_mid = [
+        "NOW","PANW","SNOW","NET","ZS","DDOG","SHOP","SQ","PYPL","UBER","LYFT","WBD"
+    ]
+    futures = ["GC=F","CL=F"]
+    # Quitar duplicados manteniendo orden
     seen = set()
     out = []
-    for s in seq:
-        if s not in seen and s is not None and s != "":
-            seen.add(s); out.append(s)
+    for t in etfs_core + megacaps + growth_mid + futures:
+        if t not in seen:
+            out.append(t); seen.add(t)
     return out
 
-def _load_universe_from_env() -> Optional[List[str]]:
-    raw = os.getenv("RANKING_UNIVERSE")
-    if raw:
-        parts = [x.strip() for x in raw.split(",")]
-        parts = [p for p in parts if p and not p.startswith("^") and "-USD" not in p]  # sin índices/cripto
-        return _dedupe_keep_order(parts) or None
-    return None
-
-def _load_universe_from_csv_path() -> Optional[List[str]]:
-    path = os.getenv("RANKING_UNIVERSE_CSV_PATH")
-    if not path:
-        return None
-    try:
-        df = pd.read_csv(path)
-        col = "symbol" if "symbol" in df.columns else ("ticker" if "ticker" in df.columns else None)
-        if not col:
-            return None
-        vals = [str(x).strip().upper() for x in df[col].tolist()]
-        vals = [v for v in vals if v and not v.startswith("^") and "-USD" not in v]
-        return _dedupe_keep_order(vals) or None
-    except Exception as e:
-        logger.warning(f"DATA_AUDIT | universo_csv_path_error | {e}")
-        return None
-
-def _load_universe_from_csv_url() -> Optional[List[str]]:
-    url = os.getenv("RANKING_UNIVERSE_CSV_URL")
-    if not url or requests is None:
-        return None
-    try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        from io import StringIO
-        df = pd.read_csv(StringIO(r.text))
-        col = "symbol" if "symbol" in df.columns else ("ticker" if "ticker" in df.columns else None)
-        if not col:
-            return None
-        vals = [str(x).strip().upper() for x in df[col].tolist()]
-        vals = [v for v in vals if v and not v.startswith("^") and "-USD" not in v]
-        return _dedupe_keep_order(vals) or None
-    except Exception as e:
-        logger.warning(f"DATA_AUDIT | universo_csv_url_error | {e}")
-        return None
-
-def build_universe() -> List[str]:
-    """
-    Orden de precedencia:
-    1) RANKING_UNIVERSE (lista inline)
-    2) RANKING_UNIVERSE_CSV_PATH (CSV local)
-    3) RANKING_UNIVERSE_CSV_URL (CSV remoto)
-    4) DEFAULT_UNIVERSE (embebido)
-    Además: respeta tu restricción de futuros: incluye GC=F y CL=F; sin cripto.
-    """
-    for src in (_load_universe_from_env, _load_universe_from_csv_path, _load_universe_from_csv_url):
-        vals = src()
-        if vals:
-            uni = vals
-            break
+def load_universe() -> List[str]:
+    custom = os.getenv("UNIVERSE_TICKERS", "").strip()
+    if custom:
+        # soporta coma o espacios
+        raw = [x.strip() for x in custom.replace(" ", ",").split(",") if x.strip()]
+        out, seen = [], set()
+        for t in raw:
+            if t not in seen: out.append(t); seen.add(t)
+        tickers = out
     else:
-        uni = DEFAULT_UNIVERSE[:]
-    # saneo adicional
-    uni = [u.strip().upper() for u in uni if u and "-USD" not in u]  # sin cripto
-    uni = _dedupe_keep_order(uni)
-    # aseguro futuros requeridos
-    for fut in ("GC=F","CL=F"):
-        if fut not in uni:
-            uni.append(fut)
-    # elimino índices (^)
-    uni = [u for u in uni if not u.startswith("^")]
-    sample = [x for x in uni[:10]]
-    logger.info(f'DATA_AUDIT | universe | {json.dumps({"count": len(uni), "tickers_sample": sample})}')
-    return uni
+        tickers = default_universe()
+    # Auditoría
+    sample = tickers[:10]
+    _log("DATA_AUDIT | universe", {"count": len(tickers), "tickers_sample": sample})
+    return tickers
 
-# ------------------------- Utilidades técnicas -------------------------
-
+# ---------------- Indicators ---------------
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False, min_periods=span).mean()
 
-def momentum_roc(series: pd.Series, window: int) -> pd.Series:
-    return series.pct_change(window)
+def wilder_rma(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
 
-def wilder_smoothing(series: pd.Series, period: int) -> pd.Series:
-    # Wilder EMA para ADX
-    alpha = 1.0 / period
-    return series.ewm(alpha=alpha, adjust=False).mean()
+def true_range(h: pd.Series, l: pd.Series, c: pd.Series) -> pd.Series:
+    prev_c = c.shift(1)
+    tr1 = h - l
+    tr2 = (h - prev_c).abs()
+    tr3 = (l - prev_c).abs()
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    # Implementación liviana de ADX (no requiere librerías externas)
-    up_move = high.diff()
-    down_move = low.diff().mul(-1.0)
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    tr1 = (high - low)
-    tr2 = (high - close.shift()).abs()
-    tr3 = (low - close.shift()).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = wilder_smoothing(tr, period)
+def atr14(df: pd.DataFrame) -> pd.Series:
+    tr = true_range(df["High"], df["Low"], df["Close"])
+    return wilder_rma(tr, 14)
 
-    plus_di = 100 * wilder_smoothing(pd.Series(plus_dm, index=high.index), period) / atr
-    minus_di = 100 * wilder_smoothing(pd.Series(minus_dm, index=high.index), period) / atr
-    dx = ( (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) ) * 100
-    adx = wilder_smoothing(dx, period)
+def adx14(df: pd.DataFrame) -> pd.Series:
+    high, low, close = df["High"], df["Low"], df["Close"]
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    tr = true_range(high, low, close)
+    atr = wilder_rma(tr, 14)
+    plus_di = 100 * wilder_rma(pd.Series(plus_dm, index=high.index), 14) / atr
+    minus_di = 100 * wilder_rma(pd.Series(minus_dm, index=high.index), 14) / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = wilder_rma(dx, 14)
     return adx
 
-# ------------------------- Descarga robusta -------------------------
+def momentum63(close: pd.Series) -> pd.Series:
+    return close.pct_change(63)
 
-def download_batch(tickers: List[str], period: str = "2y", interval: str = "1d") -> Dict[str, pd.DataFrame]:
-    """
-    Descarga por lotes. Devuelve dict por ticker con columnas ['Open','High','Low','Close','Adj Close','Volume'].
-    Si yfinance devuelve panel multiindex, lo separamos por símbolo.
-    """
-    if not tickers:
-        return {}
+def dollar_vol20(df: pd.DataFrame) -> pd.Series:
+    vol = df["Volume"].fillna(0)
+    return (df["Close"] * vol).rolling(20, min_periods=20).mean()
 
-    # yfinance limita longitudes muy grandes; hacemos rebanadas
-    out: Dict[str, pd.DataFrame] = {}
-    step = int(os.getenv("YF_BATCH_SIZE", "60"))
-    for i in range(0, len(tickers), step):
-        chunk = tickers[i:i+step]
+# -------------- Data fetch -----------------
+def fetch_history(tickers: List[str]) -> Dict[str, pd.DataFrame]:
+    if yf is None:
+        raise RuntimeError("yfinance no disponible")
+    # Primer intento: descarga por lote
+    data: Dict[str, pd.DataFrame] = {}
+    try:
+        batch = yf.download(
+            tickers=" ".join(tickers),
+            period="2y", interval="1d",
+            group_by="ticker", auto_adjust=False, threads=True, progress=False
+        )
+        # yfinance retorna MultiIndex cuando múltiples tickers
+        if isinstance(batch.columns, pd.MultiIndex):
+            for t in tickers:
+                if (t in batch.columns.get_level_values(0)) and ("Close" in batch[t]):
+                    df = batch[t].dropna(how="all")
+                    data[t] = df
+        else:
+            # Solo un ticker
+            df = batch.dropna(how="all")
+            if not df.empty:
+                data[tickers[0]] = df
+    except Exception as e:
+        _log("DATA_FETCH | batch_error", {"error": str(e)})
+
+    # Fallback por ticker si faltan
+    missing = [t for t in tickers if t not in data]
+    for t in missing:
         try:
-            df = yf.download(
-                tickers=" ".join(chunk),
-                period=period,
-                interval=interval,
-                group_by="ticker",
-                auto_adjust=False,
-                threads=True,
-                progress=False,
-            )
-            if isinstance(df.columns, pd.MultiIndex):
-                for sym in chunk:
-                    if sym in df.columns.get_level_values(0):
-                        sub = df[sym].copy()
-                        sub.columns = [c.title().replace(" ", "") for c in sub.columns]  # homogeneiza
-                        out[sym] = sub.dropna(how="all")
+            df = yf.download(tickers=t, period="2y", interval="1d", auto_adjust=False, progress=False)
+            df = df.dropna(how="all")
+            if not df.empty:
+                data[t] = df
             else:
-                # Caso de un solo símbolo
-                sub = df.copy()
-                sub.columns = [c.title().replace(" ", "") for c in sub.columns]
-                out[chunk[0]] = sub.dropna(how="all")
+                _log("yfinance", {"ticker": t, "error": "no_data"})
         except Exception as e:
-            logger.warning(f"DATA_AUDIT | batch_download_error | chunk={chunk[0]}.. | {e}")
+            _log("yfinance", {"ticker": t, "error": str(e)})
+    return data
 
+# -------------- Compute indicators ---------
+def enrich(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["EMA20"] = ema(out["Close"], 20)
+    out["EMA50"] = ema(out["Close"], 50)
+    out["ATR14"] = atr14(out)
+    out["ADX14"] = adx14(out)
+    out["MOM63"] = momentum63(out["Close"])
+    out["DollarVol20"] = dollar_vol20(out)
     return out
 
-def download_single(symbol: str, retries: int = 2, period: str = "2y", interval: str = "1d") -> Optional[pd.DataFrame]:
-    backoff = 1.0
-    for n in range(retries + 1):
-        try:
-            df = yf.download(
-                tickers=symbol,
-                period=period,
-                interval=interval,
-                group_by="ticker",
-                auto_adjust=False,
-                threads=False,
-                progress=False,
-            )
-            if df is None or df.empty:
-                raise RuntimeError("empty")
-            df.columns = [c.title().replace(" ", "") for c in df.columns]
-            return df.dropna(how="all")
-        except Exception as e:
-            if n < retries:
-                time.sleep(backoff)
-                backoff *= 2
-            else:
-                logger.warning(f"DATA_AUDIT | single_download_error | {symbol} | {e}")
-                return None
+def latest_metrics(ticker: str, df: pd.DataFrame) -> Dict[str, Any]:
+    row = df.iloc[-1]
+    # Señales long/short
+    long_ok = (row["EMA20"] > row["EMA50"]) and (row["MOM63"] > 0) and (row["ADX14"] >= MIN_ADX)
+    short_ok = (row["EMA20"] < row["EMA50"]) and (row["MOM63"] < 0) and (row["ADX14"] >= MIN_ADX)
+    # Liquidez (whitelist para futuros)
+    if ticker in FUTURES_LIQ_WHITELIST:
+        liquid = True
+    else:
+        liquid = bool(row["DollarVol20"] >= MIN_DOLLAR_VOL20) if not math.isnan(row["DollarVol20"]) else False
 
-# ------------------------- Evaluación y filtros -------------------------
-
-def evaluate_symbol(sym: str, df: pd.DataFrame, today: dt.date, cfg: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Devuelve (result, audit_row)
-    - result: dict con métricas y razones si pasa filtros; None si se excluye
-    - audit_row: siempre presente para logging
-    """
-    audit = {
-        "ticker": sym,
-        "rows": int(df.shape[0]),
-        "start": str(df.index.min().date()) if not df.empty else None,
-        "end": str(df.index.max().date()) if not df.empty else None,
-        "nan_close": int(df["Close"].isna().sum()) if "Close" in df else None,
-        "reason_excluded": None,
-    }
-
-    # Validaciones de columnas
-    need_cols = {"Open","High","Low","Close","Volume"}
-    if not need_cols.issubset(set(df.columns)):
-        audit["reason_excluded"] = "missing_cols"
-        return None, audit
-
-    # Ventana mínima de datos
-    if df.shape[0] < cfg["min_rows"]:
-        audit["reason_excluded"] = "insufficient_rows"
-        return None, audit
-
-    # Frescura (último día <= max_age_days)
-    last_day = df.index.max().date()
-    if (today - last_day).days > cfg["max_age_days"]:
-        audit["reason_excluded"] = "stale"
-        return None, audit
-
-    # Cálculos técnicos
-    close = df["Close"]
-    high, low = df["High"], df["Low"]
-    vol = df["Volume"].astype(float)
-
-    ema20 = close.ewm(span=20, adjust=False, min_periods=20).mean()
-    ema50 = close.ewm(span=50, adjust=False, min_periods=50).mean()
-    mom63 = close.pct_change(63)  # ~3 meses
-    adx14 = compute_adx(high, low, close, period=14)
-
-    # Liquidez por dólar (20d)
-    dollar_vol20 = (close * vol).rolling(20, min_periods=20).mean()
-
-    # Precio mínimo
-    if close.iloc[-1] < cfg["min_price"]:
-        audit["reason_excluded"] = "price_too_low"
-        return None, audit
-
-    # Liquidez mínima
-    if dollar_vol20.iloc[-1] < cfg["min_dollar_vol_20d"]:
-        audit["reason_excluded"] = "illiquid"
-        return None, audit
-
-    # Filtros técnicos estrictos (sin bypass)
-    if pd.isna(ema20.iloc[-1]) or pd.isna(ema50.iloc[-1]):
-        audit["reason_excluded"] = "ema_nan"
-        return None, audit
-    if ema20.iloc[-1] <= ema50.iloc[-1]:
-        audit["reason_excluded"] = "ema20<=ema50"
-        return None, audit
-
-    if pd.isna(mom63.iloc[-1]) or mom63.iloc[-1] <= 0:
-        audit["reason_excluded"] = "momentum63<=0"
-        return None, audit
-
-    if pd.isna(adx14.iloc[-1]) or adx14.iloc[-1] < cfg["min_adx"]:
-        audit["reason_excluded"] = "adx_low"
-        return None, audit
-
-    # Score para ranking (simple y estable)
-    ema_ratio = float(ema20.iloc[-1] / ema50.iloc[-1])
-    score = (mom63.iloc[-1] * 100.0) + (ema_ratio - 1.0) * 50.0 + (max(min((adx14.iloc[-1]-cfg["min_adx"]), 20), 0) * 0.5)
-
-    result = {
-        "ticker": sym,
-        "score": float(score),
-        "reasons": [
-            "ema20>ema50",
-            "momentum63_pos",
-            f"adx>={cfg['min_adx']}",
-            "avg_dollar_vol20_ok"
-        ],
-        "last_close": float(close.iloc[-1]),
-        "ema20": float(ema20.iloc[-1]),
-        "ema50": float(ema50.iloc[-1]),
-        "mom63": float(mom63.iloc[-1]),
-        "adx14": float(adx14.iloc[-1]),
-        "dollar_vol20": float(dollar_vol20.iloc[-1]),
-    }
-    return result, audit
-
-# ------------------------- Descarga -------------------------
-
-def run_full_pipeline(audit: bool=False, **kwargs) -> Dict[str, Any]:
-    """
-    Ejecuta todo y devuelve payload para API.
-    Parámetros (env):
-      - RANKING_MIN_ROWS (por defecto 150)
-      - RANKING_MAX_AGE_DAYS (por defecto 5)
-      - RANKING_MIN_PRICE (por defecto 3.0)
-      - RANKING_MIN_DOLLAR_VOL_20D (por defecto 1e7)
-      - RANKING_MIN_ADX (por defecto 15.0)
-      - RANKING_TOPN (por defecto 50)
-    """
-    t0 = time.time()
-    today = dt.date.today()
-
-    cfg = {
-        "min_rows": int(os.getenv("RANKING_MIN_ROWS", "150")),
-        "max_age_days": int(os.getenv("RANKING_MAX_AGE_DAYS", "5")),
-        "min_price": float(os.getenv("RANKING_MIN_PRICE", "3.0")),
-        "min_dollar_vol_20d": float(os.getenv("RANKING_MIN_DOLLAR_VOL_20D", "10000000")),  # 10M
-        "min_adx": float(os.getenv("RANKING_MIN_ADX", "15.0")),
-        "topn": int(os.getenv("RANKING_TOPN", "50")),
-    }
-
-    universe = build_universe()
-
-    # Descarga por lotes
-    data_map = download_batch(universe, period="2y", interval="1d")
-
-    # Fallback por símbolo que no apareció en el lote
-    missing = [s for s in universe if s not in data_map]
-    for sym in missing:
-        df = download_single(sym, retries=2, period="2y", interval="1d")
-        if df is not None and not df.empty:
-            data_map[sym] = df
-
-    survivors: List[Dict[str, Any]] = []
-    excluded_sample: List[Tuple[str,str]] = []
-
-    # Auditoría por símbolo
-    for sym in universe:
-        df = data_map.get(sym)
-        if df is None or df.empty:
-            logger.info(f'DATA_AUDIT | {json.dumps({"ticker": sym, "rows": 0, "start": None, "end": None, "nan_close": None, "reason_excluded": "no_data"})}')
-            if len(excluded_sample) < 5:
-                excluded_sample.append((sym, "no_data"))
-            continue
-        res, audit_row = evaluate_symbol(sym, df, today, cfg)
-        logger.info(f'DATA_AUDIT | {json.dumps(audit_row)}')
-        if res is not None:
-            survivors.append(res)
+    reason_excluded = None
+    if df.shape[0] < 100:
+        reason_excluded = "too_few_rows"
+    elif not liquid:
+        reason_excluded = "illiquid"
+    elif (not long_ok) and (not short_ok):
+        # Más granular
+        if row["ADX14"] < MIN_ADX:
+            reason_excluded = "adx_low"
+        elif row["EMA20"] <= row["EMA50"] and row["MOM63"] > 0:
+            reason_excluded = "ema20<=ema50"
+        elif row["EMA20"] >= row["EMA50"] and row["MOM63"] < 0:
+            reason_excluded = "momentum63<=0"
         else:
-            if len(excluded_sample) < 5:
-                excluded_sample.append((sym, str(audit_row.get("reason_excluded"))))
+            reason_excluded = "no_side"
 
-    # Ranking y selección
-    survivors.sort(key=lambda x: (-x["score"], x["ticker"]))
-    topn = survivors[: cfg["topn"]]
-    top50_tickers = [x["ticker"] for x in topn]
+    # scoring (positivo para long, para short usamos abs momentum)
+    mom = float(row["MOM63"]) if not math.isnan(row["MOM63"]) else 0.0
+    adx = float(row["ADX14"]) if not math.isnan(row["ADX14"]) else 0.0
+    score_long = adx * max(mom, 0)
+    score_short = adx * max(-mom, 0)
 
-    # Top3 (sin bypass de filtros)
-    top3 = topn[:3]
-    top3_factors = [{"ticker": x["ticker"], "reasons": x["reasons"][:]} for x in top3]
-
-    # Resumen / diagnóstico
-    fetched_count = len(data_map)
-    excluded_count = len(universe) - len(survivors)
-    diag = {
-        "universe_count": len(universe),
-        "fetched_count": fetched_count,
-        "excluded_count": excluded_count,
-        "excluded_sample": excluded_sample,
+    return {
+        "ticker": ticker,
+        "rows": int(df.shape[0]),
+        "start": str(df.index.min().date()) if df.shape[0] else None,
+        "end": str(df.index.max().date()) if df.shape[0] else None,
+        "nan_close": int(df["Close"].isna().sum()),
+        "EMA20": float(df["EMA20"].iloc[-1]),
+        "EMA50": float(df["EMA50"].iloc[-1]),
+        "ATR14": float(df["ATR14"].iloc[-1]),
+        "ADX14": float(df["ADX14"].iloc[-1]),
+        "MOM63": float(mom),
+        "DollarVol20": float(df["DollarVol20"].iloc[-1]) if not math.isnan(df["DollarVol20"].iloc[-1]) else 0.0,
+        "long_ok": bool(long_ok and liquid and df.shape[0] >= 100),
+        "short_ok": bool(short_ok and liquid and df.shape[0] >= 100),
+        "liquid": bool(liquid),
+        "reason_excluded": reason_excluded,
+        "score_long": float(score_long),
+        "score_short": float(score_short),
+        "last_close": float(df["Close"].iloc[-1])
     }
 
-    if audit or os.getenv("RANKING_DATA_AUDIT","false").lower() == "true":
-        logger.info(f'DATA_AUDIT | {json.dumps({"count": len(survivors)})}')
-        logger.info(f'DATA_AUDIT | {json.dumps({"count": len(top3), "tickers": [x["ticker"] for x in top3]})}')
+def get_live_price(ticker: str, fallback: float) -> float:
+    if yf is None:
+        return fallback
+    try:
+        info = yf.Ticker(ticker).fast_info
+        p = getattr(info, "last_price", None)
+        if p is None or np.isnan(p):
+            return fallback
+        return float(p)
+    except Exception:
+        return fallback
 
-    took = time.time() - t0
-    logger.info(f'RESUMEN | as_of={today.isoformat()} | top50={len(topn)} | top3={len(top3)}')
+def round_price(p: float) -> float:
+    if p is None or math.isnan(p):
+        return p
+    if p >= 200:
+        return round(p, 2)
+    if p >= 20:
+        return round(p, 2)
+    if p >= 1:
+        return round(p, 3)
+    return round(p, 4)
 
-    payload = {
-        "ok": True,
-        "took_s": round(took, 2),
-        "as_of": today.isoformat(),
-        "top50": top50_tickers,
-        "top3_factors": top3_factors,
-        "diag": diag,
+def compute_levels(side: str, price: float, atr: float) -> Dict[str, float]:
+    # TG se asume como precio de entrada actual (live)
+    if side == "long":
+        tg = price
+        sl = price - K_SL_ATR * atr
+        tp1 = price + K_TP1_ATR * atr
+        tp2 = price + K_TP2_ATR * atr
+        tl  = price - K_TL_ATR  * atr  # trailing start
+    else:
+        tg = price
+        sl = price + K_SL_ATR * atr
+        tp1 = price - K_TP1_ATR * atr
+        tp2 = price - K_TP2_ATR * atr
+        tl  = price + K_TL_ATR  * atr  # trailing start
+
+    return {
+        "TG": round_price(tg),
+        "SL": round_price(sl),
+        "TP1": round_price(tp1),
+        "TP2": round_price(tp2),
+        "TL": round_price(tl),
     }
-    return payload
 
-# Modo CLI rápido: python -m ranking
+# -------------- Ranking logic -------------
+def build_candidates(metrics: List[Dict[str, Any]]) -> Tuple[List[Dict[str,Any]], List[Dict[str,Any]]]:
+    strict: List[Dict[str,Any]] = []  # cumplen todo (para Top3)
+    relaxed: List[Dict[str,Any]] = [] # tendencia+liquidez, ADX puede ser menor (para completar Top50)
+    for m in metrics:
+        # Log por ticker
+        _log("DATA_AUDIT", {
+            "ticker": m["ticker"], "rows": m["rows"], "start": m["start"], "end": m["end"],
+            "nan_close": m["nan_close"], "reason_excluded": m["reason_excluded"]
+        })
+        # Strict inclusion
+        if m["long_ok"] or m["short_ok"]:
+            # elegir mejor lado si ambos (raro)
+            side = None
+            score = 0.0
+            if m["long_ok"] and m["short_ok"]:
+                if m["score_long"] >= m["score_short"]:
+                    side, score = "long", m["score_long"]
+                else:
+                    side, score = "short", m["score_short"]
+            elif m["long_ok"]:
+                side, score = "long", m["score_long"]
+            elif m["short_ok"]:
+                side, score = "short", m["score_short"]
+
+            strict.append({**m, "side": side, "score": float(score)})
+        else:
+            # relaxed: mantener tendencia y liquidez aunque ADX<M
+            trend_ok = (m["EMA20"] > m["EMA50"] and m["MOM63"] > 0) or (m["EMA20"] < m["EMA50"] and m["MOM63"] < 0)
+            if m["liquid"] and trend_ok and m["rows"] >= 100:
+                side = "long" if (m["EMA20"] > m["EMA50"]) else "short"
+                score = m["score_long"] if side=="long" else m["score_short"]
+                relaxed.append({**m, "side": side, "score": float(score)})
+    return strict, relaxed
+
+def dedupe_by_ticker(cands: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
+    best: Dict[str, Dict[str,Any]] = {}
+    for c in cands:
+        t = c["ticker"]
+        if t not in best or c["score"] > best[t]["score"]:
+            best[t] = c
+    return list(best.values())
+
+def rank_and_split(strict: List[Dict[str,Any]], relaxed: List[Dict[str,Any]]) -> Tuple[List[str], List[Dict[str,Any]]]:
+    # Dedupe por ticker y rank por score
+    strict = sorted(dedupe_by_ticker(strict), key=lambda x: x["score"], reverse=True)
+    relaxed = sorted(dedupe_by_ticker(relaxed), key=lambda x: x["score"], reverse=True)
+    # Top50
+    top50_cands = strict + [r for r in relaxed if r["ticker"] not in {c["ticker"] for c in strict}]
+    top50_cands = top50_cands[:50]
+    top50 = [c["ticker"] for c in top50_cands]
+    # Top3 estrictos solamente
+    top3 = strict[:3]
+    return top50, top3
+
+# -------------- Telegram ------------------
+def _telegram_enabled() -> Tuple[bool, str]:
+    if not ENABLE_TELEGRAM:
+        return False, "disabled_via_env"
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False, "missing_env(TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID)"
+    return True, "ok"
+
+def _dedupe_token(top3: List[Dict[str,Any]]) -> str:
+    basis = "|".join(f"{c['ticker']}:{c['side']}" for c in top3)
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return hashlib.sha256(f"{basis}:{day}".encode()).hexdigest()
+
+def _dedupe_should_send(token: str) -> bool:
+    path = f"/tmp/top3_{token}.sent"
+    return not os.path.exists(path)
+
+def _dedupe_mark_sent(token: str):
+    path = f"/tmp/top3_{token}.sent"
+    try:
+        with open(path, "w") as f:
+            f.write("1")
+    except Exception:
+        pass
+
+def _fmt_msg(top3: List[Dict[str,Any]]) -> str:
+    lines = []
+    hdr = "TOP 3 Señales (estrictas)"
+    lines.append(hdr)
+    lines.append("-" * len(hdr))
+    for c in top3:
+        t = c["ticker"]; side = c["side"].upper()
+        px = c["live_price"]; atr = c["ATR14"]; adx = c["ADX14"]; mom = c["MOM63"]
+        lv = c["levels"]
+        rr1 = abs((lv["TP1"] - lv["TG"]) / (lv["TG"] - lv["SL"])) if lv["TG"] != lv["SL"] else float("nan")
+        rr2 = abs((lv["TP2"] - lv["TG"]) / (lv["TG"] - lv["SL"])) if lv["TG"] != lv["SL"] else float("nan")
+        dist_atr = abs((lv["TP1"] - px) / atr) if atr else float("nan")
+        lines.append(
+            f"Ticker: {t} | Lado: {side}\n"
+            f"Precio: {round(px,2)} | ATR14: {round(atr,2)} | ADX14: {round(adx,1)} | Momentum63: {round(mom*100,1)}%\n"
+            f"TG: {lv['TG']} | SL: {lv['SL']} | TP1: {lv['TP1']} | TP2: {lv['TP2']} | TL: {lv['TL']}\n"
+            f"RR(TP1): {round(rr1,2)} | RR(TP2): {round(rr2,2)} | Dist a TP1: {round(dist_atr,2)} ATR\n"
+            f"--"
+        )
+    return "\n".join(lines)
+
+def notify_telegram(top3: List[Dict[str,Any]]) -> Dict[str, Any]:
+    ok, why = _telegram_enabled()
+    if not ok:
+        return {"attempted": True, "enabled": False, "reason": why}
+    import requests  # imported here to avoid dependency unless used
+    msg = _fmt_msg(top3)
+    token = _dedupe_token(top3)
+    allowed = _dedupe_should_send(token)
+    if not allowed:
+        return {"attempted": True, "enabled": True, "reason": "deduped_skip", "dedupe_check": "skip"}
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}  # no parse_mode
+        resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code == 200 and resp.json().get("ok"):
+            _dedupe_mark_sent(token)
+            return {"attempted": True, "enabled": True, "status": 200, "response": "ok", "dedupe_check": "ok_to_send"}
+        else:
+            return {"attempted": True, "enabled": True, "reason": f"send_failed(status={resp.status_code} body={resp.text})", "dedupe_check": "ok_to_send"}
+    except Exception as e:
+        return {"attempted": True, "enabled": True, "reason": f"send_exception({type(e).__name__}: {e})", "dedupe_check": "ok_to_send"}
+
+# -------------- Pipeline ------------------
+def run_full_pipeline(audit: bool=False, **_ignored) -> Dict[str, Any]:
+    t0 = time.time()
+    as_of = datetime.now(timezone.utc).date().isoformat()
+    try:
+        tickers = load_universe()
+        data = fetch_history(tickers)
+        metrics: List[Dict[str,Any]] = []
+        fetched = 0
+        excluded = 0
+        excluded_sample = []
+        for t in tickers:
+            df = data.get(t)
+            if df is None or df.empty:
+                _log("DATA_AUDIT", {"ticker": t, "rows": 0, "start": None, "end": None, "nan_close": None, "reason_excluded": "no_data"})
+                excluded += 1
+                if len(excluded_sample) < 5:
+                    excluded_sample.append([t, "no_data"])
+                continue
+            enriched = enrich(df)
+            m = latest_metrics(t, enriched)
+            metrics.append(m)
+            fetched += 1
+            if m["reason_excluded"] and len(excluded_sample) < 5:
+                excluded_sample.append([t, m["reason_excluded"]])
+
+        _log("DATA_AUDIT", {"count": fetched})
+
+        strict, relaxed = build_candidates(metrics)
+        top50, top3_cands = rank_and_split(strict, relaxed)
+
+        # Calcular niveles y motivos para top3 (reasons)
+        final_top3 = []
+        for c in top3_cands:
+            live = get_live_price(c["ticker"], c["last_close"])
+            lv = compute_levels(c["side"], live, c["ATR14"])
+            reasons = []
+            if c["side"] == "long":
+                reasons.extend(["ema20>ema50" if c["EMA20"]>c["EMA50"] else "ema20<=ema50",
+                                "momentum63_pos" if c["MOM63"]>0 else "momentum63<=0"])
+            else:
+                reasons.extend(["ema20<ema50" if c["EMA20"]<c["EMA50"] else "ema20>=ema50",
+                                "momentum63_neg" if c["MOM63"]<0 else "momentum63>=0"])
+            reasons.extend([f"adx>={MIN_ADX}", "avg_dollar_vol20_ok"])
+            final_top3.append({
+                "ticker": c["ticker"],
+                "side": c["side"],
+                "reasons": reasons,
+                "live_price": float(live),
+                "levels": lv,
+                "ATR14": c["ATR14"],
+                "ADX14": c["ADX14"],
+                "MOM63": c["MOM63"],
+            })
+
+        # Notificación Telegram SOLO si hay 3 estrictos
+        notified = False
+        notify_info = {"attempted": False, "enabled": ENABLE_TELEGRAM}
+        if len(final_top3) == 3:
+            notify_info = notify_telegram(final_top3)
+            notified = bool(notify_info.get("status") == 200 and notify_info.get("response") == "ok")
+
+        # Logs resumen
+        _log("RESUMEN", {"as_of": as_of, "top50": len(top50), "top3": len(final_top3)})
+        took = round(time.time() - t0, 2)
+        _log("app_evolutivo", {"msg": f"Pipeline listo · as_of={as_of} · top50={len(top50)} · top3_factors={len(final_top3)} · {took}s"})
+
+        # Salida JSON
+        return {
+            "ok": True,
+            "took_s": took,
+            "as_of": as_of,
+            "top50": top50,
+            "top3_factors": [{"ticker": x["ticker"], "side": x["side"], "reasons": x["reasons"], "levels": x["levels"]} for x in final_top3],
+            "diag": {
+                "universe_count": len(tickers),
+                "fetched_count": fetched,
+                "excluded_count": len([m for m in metrics if m.get("reason_excluded")]),
+                "excluded_sample": excluded_sample
+            },
+            "notified": notified,
+            "notify_info": notify_info
+        }
+    except Exception as e:
+        took = round(time.time() - t0, 2)
+        _log("ERROR", {"type": type(e).__name__, "error": str(e)})
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "took_s": took, "as_of": as_of}
+
+# Para pruebas locales rápidas
 if __name__ == "__main__":
-    print(json.dumps(run_full_pipeline(audit=True), indent=2))
+    out = run_full_pipeline(audit=True)
+    print(json.dumps(out, indent=2))
