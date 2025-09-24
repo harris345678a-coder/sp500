@@ -1,13 +1,15 @@
-
 # -*- coding: utf-8 -*-
 """
 ranking.py
 -----------------
 Pipeline robusto para construir el universo, auditar datos, calcular factores
-y devolver el Top N junto a señales (Top 3) SIN saltarse filtros obligatorios.
+y devolver el Top N junto a señales (Top 3) **sin** saltarse filtros obligatorios.
 
-Contrato: app_evolutivo importa `run_full_pipeline`.
-  from ranking import run_full_pipeline
+Contrato de importación (app_evolutivo):
+    from ranking import run_full_pipeline
+
+>>> Compatibilidad: run_full_pipeline acepta `audit` como kwarg (lo ignora).
+    Esto evita errores tipo: TypeError: ... unexpected keyword argument 'audit'
 
 Salida (dict):
 {
@@ -16,14 +18,14 @@ Salida (dict):
   "as_of": "YYYY-MM-DD",
   "top50": [symbol, ...],
   "top3_factors": [{"ticker": str, "reasons": [str, ...]}, ...],
-  "diag": {...}  # opcional: diagnósticos útiles para logging aguas arriba
+  "diag": {...}  # diagnósticos útiles para logging aguas arriba
 }
 
 Notas:
-- Universo: acciones/ETFs principales + futuros Oro/Crudo. Sin cripto.
-- Señales Top3 se eligen **solo** de candidatos que cumplen todos los filtros
+- Universo: ETFs/acciones principales + futuros Oro (GC=F) y Crudo WTI (CL=F). Sin cripto.
+- Señales Top3 se eligen **solo** entre candidatos que pasan todos los filtros
   obligatorios (p. ej. tendencia EMA20>EMA50). Si hay <3, se devuelven menos;
-  no hay relajación de filtros en fallback (cumple con el requisito del usuario).
+  no hay relajación de filtros.
 - Logs de auditoría claros al estilo:
     INFO | ranking | DATA_AUDIT | universe | {...}
     INFO | ranking | DATA_AUDIT | {'ticker': 'SPY', 'rows': 501, ...}
@@ -56,9 +58,14 @@ except Exception as e:  # pragma: no cover
     raise RuntimeError("yfinance es requerido para ranking.py") from e
 
 
+__all__ = ["run_full_pipeline", "get_universe"]
+
+
 # ==============================
 # Configuración de logging
 # ==============================
+
+_LOGGING_READY = False
 
 def _bool_env(name: str, default: bool) -> bool:
     val = os.getenv(name)
@@ -67,27 +74,34 @@ def _bool_env(name: str, default: bool) -> bool:
     return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
 def _setup_logging() -> logging.Logger:
-    level_name = os.getenv("RANKING_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-
+    global _LOGGING_READY
     logger = logging.getLogger("ranking")
-    logger.setLevel(level)
-    # Evitar duplicados si el módulo se recarga
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        fmt = "%(asctime)s | %(levelname)s | ranking | %(message)s"
-        handler.setFormatter(logging.Formatter(fmt))
-        logger.addHandler(handler)
-        logger.propagate = False
-    # yfinance logger
-    yf_debug = _bool_env("YFINANCE_DEBUG", False)
-    yf_logger = logging.getLogger("yfinance")
-    yf_logger.setLevel(logging.DEBUG if yf_debug else logging.INFO)
-    if yf_debug and not yf_logger.handlers:
-        h = logging.StreamHandler()
-        h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | yfinance | %(message)s"))
-        yf_logger.addHandler(h)
-        yf_logger.propagate = False
+
+    if not _LOGGING_READY:
+        level_name = os.getenv("RANKING_LOG_LEVEL", "INFO").upper()
+        level = getattr(logging, level_name, logging.INFO)
+        logger.setLevel(level)
+
+        # Evitar duplicados si el módulo se recarga
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            fmt = "%(asctime)s | %(levelname)s | ranking | %(message)s"
+            handler.setFormatter(logging.Formatter(fmt))
+            logger.addHandler(handler)
+            logger.propagate = False
+
+        # yfinance logger
+        yf_debug = _bool_env("YFINANCE_DEBUG", False)
+        yf_logger = logging.getLogger("yfinance")
+        yf_logger.setLevel(logging.DEBUG if yf_debug else logging.INFO)
+        if yf_debug and not yf_logger.handlers:
+            h = logging.StreamHandler()
+            h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | yfinance | %(message)s"))
+            yf_logger.addHandler(h)
+            yf_logger.propagate = False
+
+        _LOGGING_READY = True
+
     return logger
 
 log = _setup_logging()
@@ -107,9 +121,9 @@ def _log_audit(context: str, payload: Dict):
 # Universo (sin cripto)
 # ==============================
 
-# Acciones/ETFs líquidos + Futuros Oro/Crudo (Interactive Brokers friendly via Yahoo tickers)
+# ETFs/acciones líquidos + Futuros Oro/Crudo (símbolos Yahoo; compatibles con IB)
 UNIVERSE_BASE = [
-    # ETFs índices/sectors
+    # ETFs índices/sectores
     "SPY", "QQQ", "IWM", "XLK", "SOXX", "SMH", "GDX", "GLD", "SLV", "DBC", "DBA", "SHY",
     # Mega-caps
     "AAPL", "NVDA", "AMZN",
@@ -118,7 +132,7 @@ UNIVERSE_BASE = [
     "CL=F",  # Crudo WTI
 ]
 
-# Límite superior que llamamos "Top50": si el universo es menor, será ese tamaño.
+# Límite superior para el "Top50": si el universo es menor, se devuelve su tamaño.
 TOP50_CAP = 50
 
 
@@ -214,7 +228,9 @@ def _fetch_history(symbol: str, params: FetchParams) -> Optional[pd.DataFrame]:
 # Factores y Filtros
 # ==============================
 
-@dataclass
+from dataclasses import dataclass as _dataclass_reuse
+
+@_dataclass_reuse
 class SignalResult:
     ticker: str
     reasons: List[str]
@@ -307,7 +323,17 @@ def get_universe() -> List[str]:
 # Pipeline principal
 # ==============================
 
-def run_full_pipeline() -> Dict:
+def run_full_pipeline(*, audit: Optional[bool] = None, **_) -> Dict:
+    """
+    Ejecuta el pipeline completo.
+
+    Parámetros
+    ----------
+    audit : Optional[bool]
+        Aceptado por compatibilidad con app_evolutivo; **no modifica** el comportamiento.
+    **_ : dict
+        Captura kwargs futuros para mantener compatibilidad hacia adelante.
+    """
     t0 = time.time()
     as_of = datetime.now().date().isoformat()
     universe = get_universe()
