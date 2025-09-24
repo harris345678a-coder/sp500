@@ -1,303 +1,449 @@
 # -*- coding: utf-8 -*-
 """
-Archivo: ranking.py
-(versión robusta con universo dinámico, descarga en lote y filtros estrictos)
+ranking.py — pipeline robusto para ranking + top3.
+
+Características clave
+- Universo por defecto amplio y líquido (sin depender de CSV/URL).
+- Opcional: universo por env var (lista), CSV local o CSV remoto.
+- Descarga por lotes con yfinance.download() + fallback por símbolo con reintentos.
+- Filtros estrictos: datos suficientes, frescura, EMA20>EMA50, momentum63>0,
+  precio mínimo, liquidez por dólar-vol 20d. Sin bypass en fallback.
+- Logs de auditoría: "DATA_AUDIT | ..." por símbolo y "RESUMEN | ...".
+- API: run_full_pipeline(audit=False) -> dict compatible con app_evolutivo.
+
+Requisitos: yfinance, pandas, numpy, requests.
 """
 from __future__ import annotations
-import os, time, math, json, logging
-from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Tuple
 
+import os
+import time
+import json
+import math
+import logging
+import datetime as dt
+from typing import List, Dict, Any, Optional, Tuple
+
+import numpy as np
 import pandas as pd
-import yfinance as yf
 
-__all__ = ["run_full_pipeline", "get_universe"]
+# Dependencia principal de datos
+try:
+    import yfinance as yf
+except Exception as e:
+    raise RuntimeError("Necesitas instalar yfinance") from e
 
-# ---- Logging ----
-def _bool_env(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None: return default
-    return str(val).strip().lower() in ("1","true","yes","y","on")
+try:
+    import requests  # sólo si se usa CSV remoto
+except Exception:
+    requests = None
 
-def _setup_logging() -> logging.Logger:
-    logger = logging.getLogger("ranking")
-    level_name = os.getenv("RANKING_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    logger.setLevel(level)
-    if not logger.handlers:
-        h = logging.StreamHandler()
-        h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | ranking | %(message)s"))
-        logger.addHandler(h)
-        logger.propagate = False
-    yf_debug = _bool_env("YFINANCE_DEBUG", False)
-    yf_logger = logging.getLogger("yfinance")
-    yf_logger.setLevel(logging.DEBUG if yf_debug else logging.INFO)
-    if yf_debug and not yf_logger.handlers:
-        yh = logging.StreamHandler()
-        yh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | yfinance | %(message)s"))
-        yf_logger.addHandler(yh); yf_logger.propagate = False
-    return logger
+# ------------------------- Logging -------------------------
 
-log = _setup_logging()
-DATA_AUDIT_ON = _bool_env("RANKING_DATA_AUDIT", True)
-def _log_audit(context: str, payload: Dict):
-    if DATA_AUDIT_ON and log.isEnabledFor(logging.INFO):
-        if context:
-            log.info("DATA_AUDIT | %s | %s", context, json.dumps(payload, ensure_ascii=False))
-        else:
-            log.info("DATA_AUDIT | %s", json.dumps(payload, ensure_ascii=False))
+LOG_LEVEL = os.getenv("RANKING_LOG_LEVEL", "INFO").upper()
+logger = logging.getLogger("ranking")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    handler.setFormatter(fmt)
+    logger.addHandler(handler)
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
-# ---- Universo ----
-UNIVERSE_BASE = [
-    "SPY","QQQ","IWM","XLK","SOXX","SMH","GDX","GLD","SLV","DBC","DBA","SHY",
-    "AAPL","NVDA","AMZN","GC=F","CL=F"
+# ------------------------- Universo por defecto -------------------------
+# Universo amplio "embedded" (líquido y generalista).
+# Incluye: índices/sectores (ETFs), commodities/bonos (ETFs), mega-caps,
+# semis, energía, salud, consumo, bancos; + futuros GC=F y CL=F.
+# (Sin cripto).
+DEFAULT_UNIVERSE: List[str] = [
+    # Index/market ETFs
+    "SPY","QQQ","IWM","DIA","VTI","VOO","IVV","VTV","VOE","VUG","VGT","VHT","VFH","VNQ",
+    # Sector SPDRs
+    "XLK","XLE","XLF","XLY","XLP","XLV","XLI","XLB","XLRE","XLU","XLC",
+    # Thematic / industry ETFs
+    "SOXX","SMH","XME","GDX","GDXJ","IBB","XBI","IYR","IYT","KRE","XOP","OIH","XHB","ITB",
+    "KWEB","HACK","CIBR","TAN","URA","XRT","XAR","XTL",
+    # Commodities/Bonds ETFs
+    "GLD","SLV","DBC","DBA","USO","UNG","TLT","IEF","SHY","LQD","HYG",
+    # Megacaps / líderes liquidez
+    "AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","TSLA","AVGO","ADBE","CSCO","CRM","NFLX",
+    "AMD","INTC","QCOM","TXN","MU","AMAT","ASML",
+    "JPM","BAC","WFC","GS","MS","BLK","C",
+    "XOM","CVX","COP","SLB","EOG","PSX",
+    "UNH","JNJ","LLY","ABBV","MRK","PFE","TMO","DHR",
+    "HD","LOW","COST","WMT","TGT","NKE","SBUX","MCD","BKNG",
+    "CAT","DE","BA","GE","HON","UPS","FDX","MMM",
+    "KO","PEP","PG","CL","KHC","MDLZ",
+    "ORCL","SAP","NOW","PANW","SNOW","NET","ZS","DDOG",
+    "SHOP","SQ","PYPL","UBER","LYFT",
+    "DIS","CMCSA","T","VZ","WBD",
+    "V","MA","AXP","INTU",
+    # Futuros (solo oro y petróleo, como solicitaste)
+    "GC=F","CL=F",
 ]
 
-def _safe_name(s: str) -> str: return s.strip()
-
-def _load_universe_from_env_inline() -> Optional[List[str]]:
-    raw = os.getenv("RANKING_UNIVERSE")
-    if not raw: return None
-    out, seen = [], set()
-    for part in raw.split(","):
-        t = _safe_name(part)
-        if t and t not in seen:
-            seen.add(t); out.append(t)
-    return out or None
-
-def _load_universe_from_csv(path: str) -> Optional[List[str]]:
-    try:
-        df = pd.read_csv(path)
-        col = None
-        for c in df.columns:
-            if str(c).lower() in ("symbol","ticker","symbols","tickers"): col=c; break
-        if col is None: col = df.columns[0]
-        vals = [ _safe_name(str(x)) for x in df[col].dropna().astype(str) ]
-        out, seen = [], set()
-        for v in vals:
-            if v and v not in seen:
-                seen.add(v); out.append(v)
-        return out or None
-    except Exception as e:
-        log.warning("UNIVERSE_CSV_FAIL | %s | %r", path, e); return None
-
-def _load_universe_from_url(url: str) -> Optional[List[str]]:
-    try:
-        df = pd.read_csv(url)
-        col = None
-        for c in df.columns:
-            if str(c).lower() in ("symbol","ticker","symbols","tickers"): col=c; break
-        if col is None: col = df.columns[0]
-        vals = [ _safe_name(str(x)) for x in df[col].dropna().astype(str) ]
-        out, seen = [], set()
-        for v in vals:
-            if v and v not in seen:
-                seen.add(v); out.append(v)
-        return out or None
-    except Exception as e:
-        log.warning("UNIVERSE_URL_FAIL | %s | %r", url, e); return None
-
-def get_universe() -> List[str]:
-    env_list = _load_universe_from_env_inline()
-    if env_list:
-        _log_audit("universe_source", {"source":"RANKING_UNIVERSE","count":len(env_list)})
-        return env_list
-    path = os.getenv("RANKING_UNIVERSE_CSV_PATH")
-    if path:
-        lst = _load_universe_from_csv(path)
-        if lst:
-            _log_audit("universe_source", {"source":"RANKING_UNIVERSE_CSV_PATH","path":path,"count":len(lst)})
-            return lst
-    url = os.getenv("RANKING_UNIVERSE_CSV_URL")
-    if url:
-        lst = _load_universe_from_url(url)
-        if lst:
-            _log_audit("universe_source", {"source":"RANKING_UNIVERSE_CSV_URL","url":url,"count":len(lst)})
-            return lst
-    # fallback
-    out, seen = [], set()
-    for s in UNIVERSE_BASE:
-        s = _safe_name(s)
-        if s and s not in seen:
+def _dedupe_keep_order(seq: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for s in seq:
+        if s not in seen and s is not None and s != "":
             seen.add(s); out.append(s)
-    _log_audit("universe_source", {"source":"UNIVERSE_BASE","count":len(out)})
     return out
 
-# ---- Parámetros / Filtros ----
-@dataclass
-class FetchParams:
-    period: str = "2y"
-    interval: str = "1d"
-    auto_adjust: bool = True
-    actions: bool = True
-    min_rows: int = 200
-    max_stale_days: int = 7
+def _load_universe_from_env() -> Optional[List[str]]:
+    raw = os.getenv("RANKING_UNIVERSE")
+    if raw:
+        parts = [x.strip() for x in raw.split(",")]
+        parts = [p for p in parts if p and not p.startswith("^") and "-USD" not in p]  # sin índices/cripto
+        return _dedupe_keep_order(parts) or None
+    return None
 
-FETCH = FetchParams()
-
-@dataclass
-class Filters:
-    require_trend_up: bool = True
-    min_price: float = 1.0
-    min_dollar_vol_20d: float = 5e6
-
-FILTERS = Filters()
-TOP50_CAP = 50
-
-# ---- Utils ----
-def _normalize_history_df(df: pd.DataFrame) -> pd.DataFrame:
-    if "Close" not in df.columns and "Adj Close" in df.columns:
-        df = df.copy(); df["Close"] = df["Adj Close"]
-    return df
-
-def _ema(s: pd.Series, span: int) -> pd.Series:
-    return s.ewm(span=span, adjust=False).mean()
-
-def _highest(s: pd.Series, n: int) -> pd.Series:
-    return s.rolling(n, min_periods=n).max()
-
-def _dollar_volume(df: pd.DataFrame) -> pd.Series:
-    if "Close" in df.columns and "Volume" in df.columns:
-        return df["Close"] * df["Volume"].fillna(0)
-    return pd.Series([0]*len(df), index=df.index)
-
-# ---- Fetch ----
-def _fetch_bulk(symbols: List[str], params: FetchParams) -> Dict[str, pd.DataFrame]:
-    if not symbols: return {}
+def _load_universe_from_csv_path() -> Optional[List[str]]:
+    path = os.getenv("RANKING_UNIVERSE_CSV_PATH")
+    if not path:
+        return None
     try:
-        data = yf.download(
-            tickers=" ".join(symbols),
-            period=params.period, interval=params.interval,
-            auto_adjust=params.auto_adjust, actions=params.actions,
-            group_by="ticker", threads=True, progress=False,
-        )
-        out = {}
-        if isinstance(data.columns, pd.MultiIndex):
-            for sym in symbols:
-                if sym in data.columns.get_level_values(0):
-                    sub = data[sym].dropna(how="all")
-                    if not sub.empty:
-                        out[sym] = _normalize_history_df(sub)
-        else:
-            sub = data.dropna(how="all")
-            if not sub.empty:
-                out[symbols[0]] = _normalize_history_df(sub)
-        return out
+        df = pd.read_csv(path)
+        col = "symbol" if "symbol" in df.columns else ("ticker" if "ticker" in df.columns else None)
+        if not col:
+            return None
+        vals = [str(x).strip().upper() for x in df[col].tolist()]
+        vals = [v for v in vals if v and not v.startswith("^") and "-USD" not in v]
+        return _dedupe_keep_order(vals) or None
     except Exception as e:
-        log.warning("BULK_DOWNLOAD_FAIL | %d symbols | %r", len(symbols), e); return {}
+        logger.warning(f"DATA_AUDIT | universo_csv_path_error | {e}")
+        return None
 
-def _fetch_single(symbol: str, params: FetchParams) -> Optional[pd.DataFrame]:
-    tries, backoff = 3, 0.8
-    for i in range(1, tries+1):
+def _load_universe_from_csv_url() -> Optional[List[str]]:
+    url = os.getenv("RANKING_UNIVERSE_CSV_URL")
+    if not url or requests is None:
+        return None
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        from io import StringIO
+        df = pd.read_csv(StringIO(r.text))
+        col = "symbol" if "symbol" in df.columns else ("ticker" if "ticker" in df.columns else None)
+        if not col:
+            return None
+        vals = [str(x).strip().upper() for x in df[col].tolist()]
+        vals = [v for v in vals if v and not v.startswith("^") and "-USD" not in v]
+        return _dedupe_keep_order(vals) or None
+    except Exception as e:
+        logger.warning(f"DATA_AUDIT | universo_csv_url_error | {e}")
+        return None
+
+def build_universe() -> List[str]:
+    """
+    Orden de precedencia:
+    1) RANKING_UNIVERSE (lista inline)
+    2) RANKING_UNIVERSE_CSV_PATH (CSV local)
+    3) RANKING_UNIVERSE_CSV_URL (CSV remoto)
+    4) DEFAULT_UNIVERSE (embebido)
+    Además: respeta tu restricción de futuros: incluye GC=F y CL=F; sin cripto.
+    """
+    for src in (_load_universe_from_env, _load_universe_from_csv_path, _load_universe_from_csv_url):
+        vals = src()
+        if vals:
+            uni = vals
+            break
+    else:
+        uni = DEFAULT_UNIVERSE[:]
+    # saneo adicional
+    uni = [u.strip().upper() for u in uni if u and "-USD" not in u]  # sin cripto
+    uni = _dedupe_keep_order(uni)
+    # aseguro futuros requeridos
+    for fut in ("GC=F","CL=F"):
+        if fut not in uni:
+            uni.append(fut)
+    # elimino índices (^)
+    uni = [u for u in uni if not u.startswith("^")]
+    sample = [x for x in uni[:10]]
+    logger.info(f'DATA_AUDIT | universe | {json.dumps({"count": len(uni), "tickers_sample": sample})}')
+    return uni
+
+# ------------------------- Utilidades técnicas -------------------------
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False, min_periods=span).mean()
+
+def momentum_roc(series: pd.Series, window: int) -> pd.Series:
+    return series.pct_change(window)
+
+def wilder_smoothing(series: pd.Series, period: int) -> pd.Series:
+    # Wilder EMA para ADX
+    alpha = 1.0 / period
+    return series.ewm(alpha=alpha, adjust=False).mean()
+
+def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    # Implementación liviana de ADX (no requiere librerías externas)
+    up_move = high.diff()
+    down_move = low.diff().mul(-1.0)
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr1 = (high - low)
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = wilder_smoothing(tr, period)
+
+    plus_di = 100 * wilder_smoothing(pd.Series(plus_dm, index=high.index), period) / atr
+    minus_di = 100 * wilder_smoothing(pd.Series(minus_dm, index=high.index), period) / atr
+    dx = ( (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) ) * 100
+    adx = wilder_smoothing(dx, period)
+    return adx
+
+# ------------------------- Descarga robusta -------------------------
+
+def download_batch(tickers: List[str], period: str = "2y", interval: str = "1d") -> Dict[str, pd.DataFrame]:
+    """
+    Descarga por lotes. Devuelve dict por ticker con columnas ['Open','High','Low','Close','Adj Close','Volume'].
+    Si yfinance devuelve panel multiindex, lo separamos por símbolo.
+    """
+    if not tickers:
+        return {}
+
+    # yfinance limita longitudes muy grandes; hacemos rebanadas
+    out: Dict[str, pd.DataFrame] = {}
+    step = int(os.getenv("YF_BATCH_SIZE", "60"))
+    for i in range(0, len(tickers), step):
+        chunk = tickers[i:i+step]
         try:
-            df = yf.Ticker(symbol).history(
-                period=params.period, interval=params.interval,
-                auto_adjust=params.auto_adjust, actions=params.actions,
+            df = yf.download(
+                tickers=" ".join(chunk),
+                period=period,
+                interval=interval,
+                group_by="ticker",
+                auto_adjust=False,
+                threads=True,
+                progress=False,
             )
-            if df is None or df.empty: raise RuntimeError("history vacío")
-            df = _normalize_history_df(df)
-            for col in ("Open","High","Low","Close"): 
-                if col not in df.columns: raise RuntimeError(f"columna faltante: {col}")
-            return df
+            if isinstance(df.columns, pd.MultiIndex):
+                for sym in chunk:
+                    if sym in df.columns.get_level_values(0):
+                        sub = df[sym].copy()
+                        sub.columns = [c.title().replace(" ", "") for c in sub.columns]  # homogeneiza
+                        out[sym] = sub.dropna(how="all")
+            else:
+                # Caso de un solo símbolo
+                sub = df.copy()
+                sub.columns = [c.title().replace(" ", "") for c in sub.columns]
+                out[chunk[0]] = sub.dropna(how="all")
         except Exception as e:
-            if i == tries:
-                log.warning("FETCH_FAIL | %s | intento=%s/%s | %r", symbol, i, tries, e); return None
-            time.sleep(backoff*i)
+            logger.warning(f"DATA_AUDIT | batch_download_error | chunk={chunk[0]}.. | {e}")
 
-# ---- Filtros / Señales ----
-def _apply_mandatory_filters(symbol: str, df: pd.DataFrame) -> Tuple[bool, Optional[str]]:
-    if len(df) < FETCH.min_rows: return False, f"min_rows<{FETCH.min_rows}"
-    last_dt = df.index[-1]
-    if hasattr(last_dt, "to_pydatetime"): last_dt = last_dt.to_pydatetime()
-    if datetime.now(timezone.utc) - last_dt.replace(tzinfo=timezone.utc) > timedelta(days=FETCH.max_stale_days):
-        return False, "stale_data"
-    last_close = float(df["Close"].iloc[-1])
-    if last_close < FILTERS.min_price: return False, f"price<{FILTERS.min_price}"
-    if FILTERS.require_trend_up:
-        ema20 = _ema(df["Close"], 20); ema50 = _ema(df["Close"], 50)
-        if not bool(ema20.iloc[-1] > ema50.iloc[-1]): return False, "ema20<=ema50"
-    dv = _dollar_volume(df).rolling(20).mean()
-    if dv.iloc[-1] < FILTERS.min_dollar_vol_20d: return False, f"dollar_vol20<{int(FILTERS.min_dollar_vol_20d)}"
-    return True, None
+    return out
 
-def _compute_signals(symbol: str, df: pd.DataFrame) -> List[str]:
-    reasons = []
-    hi55 = _highest(df["Close"], 55)
-    if not math.isnan(hi55.iloc[-1]) and df["Close"].iloc[-1] > hi55.iloc[-1]: reasons.append("breakout55")
-    ema20 = _ema(df["Close"], 20); ema50 = _ema(df["Close"], 50)
-    if ema20.iloc[-1] > ema50.iloc[-1]: reasons.append("ema20>ema50")
-    if len(df) >= 63 and df["Close"].pct_change(63).iloc[-1] > 0: reasons.append("momentum63_pos")
-    return reasons
+def download_single(symbol: str, retries: int = 2, period: str = "2y", interval: str = "1d") -> Optional[pd.DataFrame]:
+    backoff = 1.0
+    for n in range(retries + 1):
+        try:
+            df = yf.download(
+                tickers=symbol,
+                period=period,
+                interval=interval,
+                group_by="ticker",
+                auto_adjust=False,
+                threads=False,
+                progress=False,
+            )
+            if df is None or df.empty:
+                raise RuntimeError("empty")
+            df.columns = [c.title().replace(" ", "") for c in df.columns]
+            return df.dropna(how="all")
+        except Exception as e:
+            if n < retries:
+                time.sleep(backoff)
+                backoff *= 2
+            else:
+                logger.warning(f"DATA_AUDIT | single_download_error | {symbol} | {e}")
+                return None
 
-def _score_for_top50(df: pd.DataFrame) -> float:
-    c = df["Close"]
-    r63 = c.pct_change(63).iloc[-1] if len(c) >= 63 else 0.0
-    r126 = c.pct_change(126).iloc[-1] if len(c) >= 126 else r63
-    return float(0.5*r63 + 0.5*r126)
+# ------------------------- Evaluación y filtros -------------------------
 
-# ---- Pipeline ----
-def run_full_pipeline(*, audit: Optional[bool]=None, **_) -> Dict:
-    t0 = time.time(); as_of = datetime.now().date().isoformat()
-    universe = get_universe()
-    _log_audit("universe", {"count": len(universe), "tickers_sample": universe[:10]})
+def evaluate_symbol(sym: str, df: pd.DataFrame, today: dt.date, cfg: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Devuelve (result, audit_row)
+    - result: dict con métricas y razones si pasa filtros; None si se excluye
+    - audit_row: siempre presente para logging
+    """
+    audit = {
+        "ticker": sym,
+        "rows": int(df.shape[0]),
+        "start": str(df.index.min().date()) if not df.empty else None,
+        "end": str(df.index.max().date()) if not df.empty else None,
+        "nan_close": int(df["Close"].isna().sum()) if "Close" in df else None,
+        "reason_excluded": None,
+    }
 
-    fetched, excluded = {}, {}
-    top50_candidates = []
-    top3 = []
+    # Validaciones de columnas
+    need_cols = {"Open","High","Low","Close","Volume"}
+    if not need_cols.issubset(set(df.columns)):
+        audit["reason_excluded"] = "missing_cols"
+        return None, audit
 
-    BULK_THRESHOLD = 30
-    remaining = list(universe)
+    # Ventana mínima de datos
+    if df.shape[0] < cfg["min_rows"]:
+        audit["reason_excluded"] = "insufficient_rows"
+        return None, audit
 
-    if len(universe) >= BULK_THRESHOLD:
-        bulk = _fetch_bulk(universe, FETCH)
-        for sym, df in bulk.items():
-            if sym in remaining: remaining.remove(sym)
-            df = df.dropna(subset=["Close"]).copy()
-            payload = {"ticker": sym, "rows": int(len(df)),
-                       "start": str(df.index[0].date()) if len(df) else None,
-                       "end": str(df.index[-1].date()) if len(df) else None,
-                       "nan_close": int(df["Close"].isna().sum()), "reason_excluded": None}
-            ok, reason = _apply_mandatory_filters(sym, df)
-            if not ok: payload["reason_excluded"]=reason; excluded[sym]=reason or "filter_fail"
-            else: fetched[sym]=df
-            _log_audit("", payload)
+    # Frescura (último día <= max_age_days)
+    last_day = df.index.max().date()
+    if (today - last_day).days > cfg["max_age_days"]:
+        audit["reason_excluded"] = "stale"
+        return None, audit
 
-    for sym in remaining:
-        df = _fetch_single(sym, FETCH)
-        if df is None or df.empty: excluded[sym]="fetch_fail_or_empty"; continue
-        df = df.dropna(subset=["Close"]).copy()
-        payload = {"ticker": sym, "rows": int(len(df)),
-                   "start": str(df.index[0].date()) if len(df) else None,
-                   "end": str(df.index[-1].date()) if len(df) else None,
-                   "nan_close": int(df["Close"].isna().sum()), "reason_excluded": None}
-        ok, reason = _apply_mandatory_filters(sym, df)
-        if not ok: payload["reason_excluded"]=reason; excluded[sym]=reason or "filter_fail"
-        else: fetched[sym]=df
-        _log_audit("", payload)
+    # Cálculos técnicos
+    close = df["Close"]
+    high, low = df["High"], df["Low"]
+    vol = df["Volume"].astype(float)
 
-    for sym, df in fetched.items():
-        top50_candidates.append((sym, _score_for_top50(df)))
-    top50_candidates.sort(key=lambda x: x[1], reverse=True)
-    top50_list = [s for s,_ in top50_candidates[:50]]
+    ema20 = close.ewm(span=20, adjust=False, min_periods=20).mean()
+    ema50 = close.ewm(span=50, adjust=False, min_periods=50).mean()
+    mom63 = close.pct_change(63)  # ~3 meses
+    adx14 = compute_adx(high, low, close, period=14)
 
-    for sym, _ in top50_candidates:
-        if len(top3) >= 3: break
-        reasons = _compute_signals(sym, fetched[sym])
-        if reasons: top3.append({"ticker": sym, "reasons": reasons})
+    # Liquidez por dólar (20d)
+    dollar_vol20 = (close * vol).rolling(20, min_periods=20).mean()
 
-    _log_audit("", {"count": len(top50_list)})
-    _log_audit("", {"count": len(top3), "tickers": [s["ticker"] for s in top3]})
-    log.info("RESUMEN | as_of=%s | top50=%d | top3=%d", as_of, len(top50_list), len(top3))
+    # Precio mínimo
+    if close.iloc[-1] < cfg["min_price"]:
+        audit["reason_excluded"] = "price_too_low"
+        return None, audit
 
-    diag = {"universe_count": len(universe),
-            "fetched_count": len(fetched),
-            "excluded_count": len(excluded),
-            "excluded_sample": list({k:v for k,v in list(excluded.items())[:5]}.items())}
+    # Liquidez mínima
+    if dollar_vol20.iloc[-1] < cfg["min_dollar_vol_20d"]:
+        audit["reason_excluded"] = "illiquid"
+        return None, audit
 
-    return {"ok": True, "took_s": round(time.time()-t0,2), "as_of": as_of,
-            "top50": top50_list, "top3_factors": top3, "diag": diag}
+    # Filtros técnicos estrictos (sin bypass)
+    if pd.isna(ema20.iloc[-1]) or pd.isna(ema50.iloc[-1]):
+        audit["reason_excluded"] = "ema_nan"
+        return None, audit
+    if ema20.iloc[-1] <= ema50.iloc[-1]:
+        audit["reason_excluded"] = "ema20<=ema50"
+        return None, audit
 
+    if pd.isna(mom63.iloc[-1]) or mom63.iloc[-1] <= 0:
+        audit["reason_excluded"] = "momentum63<=0"
+        return None, audit
+
+    if pd.isna(adx14.iloc[-1]) or adx14.iloc[-1] < cfg["min_adx"]:
+        audit["reason_excluded"] = "adx_low"
+        return None, audit
+
+    # Score para ranking (simple y estable)
+    ema_ratio = float(ema20.iloc[-1] / ema50.iloc[-1])
+    score = (mom63.iloc[-1] * 100.0) + (ema_ratio - 1.0) * 50.0 + (max(min((adx14.iloc[-1]-cfg["min_adx"]), 20), 0) * 0.5)
+
+    result = {
+        "ticker": sym,
+        "score": float(score),
+        "reasons": [
+            "ema20>ema50",
+            "momentum63_pos",
+            f"adx>={cfg['min_adx']}",
+            "avg_dollar_vol20_ok"
+        ],
+        "last_close": float(close.iloc[-1]),
+        "ema20": float(ema20.iloc[-1]),
+        "ema50": float(ema50.iloc[-1]),
+        "mom63": float(mom63.iloc[-1]),
+        "adx14": float(adx14.iloc[-1]),
+        "dollar_vol20": float(dollar_vol20.iloc[-1]),
+    }
+    return result, audit
+
+# ------------------------- Descarga -------------------------
+
+def run_full_pipeline(audit: bool=False, **kwargs) -> Dict[str, Any]:
+    """
+    Ejecuta todo y devuelve payload para API.
+    Parámetros (env):
+      - RANKING_MIN_ROWS (por defecto 150)
+      - RANKING_MAX_AGE_DAYS (por defecto 5)
+      - RANKING_MIN_PRICE (por defecto 3.0)
+      - RANKING_MIN_DOLLAR_VOL_20D (por defecto 1e7)
+      - RANKING_MIN_ADX (por defecto 15.0)
+      - RANKING_TOPN (por defecto 50)
+    """
+    t0 = time.time()
+    today = dt.date.today()
+
+    cfg = {
+        "min_rows": int(os.getenv("RANKING_MIN_ROWS", "150")),
+        "max_age_days": int(os.getenv("RANKING_MAX_AGE_DAYS", "5")),
+        "min_price": float(os.getenv("RANKING_MIN_PRICE", "3.0")),
+        "min_dollar_vol_20d": float(os.getenv("RANKING_MIN_DOLLAR_VOL_20D", "10000000")),  # 10M
+        "min_adx": float(os.getenv("RANKING_MIN_ADX", "15.0")),
+        "topn": int(os.getenv("RANKING_TOPN", "50")),
+    }
+
+    universe = build_universe()
+
+    # Descarga por lotes
+    data_map = download_batch(universe, period="2y", interval="1d")
+
+    # Fallback por símbolo que no apareció en el lote
+    missing = [s for s in universe if s not in data_map]
+    for sym in missing:
+        df = download_single(sym, retries=2, period="2y", interval="1d")
+        if df is not None and not df.empty:
+            data_map[sym] = df
+
+    survivors: List[Dict[str, Any]] = []
+    excluded_sample: List[Tuple[str,str]] = []
+
+    # Auditoría por símbolo
+    for sym in universe:
+        df = data_map.get(sym)
+        if df is None or df.empty:
+            logger.info(f'DATA_AUDIT | {json.dumps({"ticker": sym, "rows": 0, "start": None, "end": None, "nan_close": None, "reason_excluded": "no_data"})}')
+            if len(excluded_sample) < 5:
+                excluded_sample.append((sym, "no_data"))
+            continue
+        res, audit_row = evaluate_symbol(sym, df, today, cfg)
+        logger.info(f'DATA_AUDIT | {json.dumps(audit_row)}')
+        if res is not None:
+            survivors.append(res)
+        else:
+            if len(excluded_sample) < 5:
+                excluded_sample.append((sym, str(audit_row.get("reason_excluded"))))
+
+    # Ranking y selección
+    survivors.sort(key=lambda x: (-x["score"], x["ticker"]))
+    topn = survivors[: cfg["topn"]]
+    top50_tickers = [x["ticker"] for x in topn]
+
+    # Top3 (sin bypass de filtros)
+    top3 = topn[:3]
+    top3_factors = [{"ticker": x["ticker"], "reasons": x["reasons"][:]} for x in top3]
+
+    # Resumen / diagnóstico
+    fetched_count = len(data_map)
+    excluded_count = len(universe) - len(survivors)
+    diag = {
+        "universe_count": len(universe),
+        "fetched_count": fetched_count,
+        "excluded_count": excluded_count,
+        "excluded_sample": excluded_sample,
+    }
+
+    if audit or os.getenv("RANKING_DATA_AUDIT","false").lower() == "true":
+        logger.info(f'DATA_AUDIT | {json.dumps({"count": len(survivors)})}')
+        logger.info(f'DATA_AUDIT | {json.dumps({"count": len(top3), "tickers": [x["ticker"] for x in top3]})}')
+
+    took = time.time() - t0
+    logger.info(f'RESUMEN | as_of={today.isoformat()} | top50={len(topn)} | top3={len(top3)}')
+
+    payload = {
+        "ok": True,
+        "took_s": round(took, 2),
+        "as_of": today.isoformat(),
+        "top50": top50_tickers,
+        "top3_factors": top3_factors,
+        "diag": diag,
+    }
+    return payload
+
+# Modo CLI rápido: python -m ranking
 if __name__ == "__main__":
-    out = run_full_pipeline()
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    print(json.dumps(run_full_pipeline(audit=True), indent=2))
