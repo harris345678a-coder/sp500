@@ -1,366 +1,543 @@
+# -*- coding: utf-8 -*-
+"""
+App Evolutivo - Señales Top3 con enriquecimiento dinámico y envío a Telegram
+----------------------------------------------------------------------------
+- Endpoint principal: /signals/run-top3?token=123&send_tg=true&dedupe_tg=true
+- Compatibilidad: /rank/run-top3 (misma lógica)
+- Usa ranking.run_full_pipeline() para obtener top50 y top3_factors
+- Si existe presend_rules.build_top3_signals(payload) lo usa; si no, aplica fallback estricto
+- Enriquecimiento dinámico (ATR/ADX/EMA/MOM, TG/SL/TP1/TP2, RR) con datos en vivo (yfinance)
+- Mensajería Telegram en HTML con escape seguro (sin 400 de "can't parse entities")
+- Persistencia de último payload y digest para dedupe y auditoría
+
+Requiere en el entorno (Render):
+- API_TOKEN=123
+- TELEGRAM_BOT_TOKEN ó BOT_TOKEN
+- TELEGRAM_CHAT_ID ó CHAT_ID
+- (opcional) TELEGRAM_NOTIFY_EMPTY=true
+
+Coeficientes ATR (ajustables):
+- LONG: SL = TG - 1.20*ATR, TP1 = TG + 1.00*ATR, TP2 = TG + 1.90*ATR
+- SHORT: inverso
+"""
 
 import os
-from pathlib import Path
+import io
 import json
+import math
+import time
 import hashlib
-from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime, timezone
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-# --- Tu pipeline existente ---
-# Deben existir en el repo (¡no los tocamos aquí!)
-from ranking import run_full_pipeline     # -> calcula top50 y factores top3
-from presend_rules import build_top3_signals  # -> aplica TODOS los filtros (26) y produce señales finales
+# ---------------------------- Logging -------------------------------------
+logger = logging.getLogger("app_evolutivo")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    handler.setFormatter(fmt)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-# ============================================================
-# Configuración
-# ============================================================
-RUN_TOKEN = os.getenv("RUN_TOKEN", "123")  # token raíz (fijo por tu requerimiento)
-DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/evolutivo"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# ---------------------------- Config --------------------------------------
+API_TOKEN = os.getenv("API_TOKEN", "123")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "1") not in ("0", "false", "False", "")
 
-LAST_JSON = DATA_DIR / "last_payload.json"
-LAST_SIGN = DATA_DIR / "last_signature.txt"
+ADX_MIN = float(os.getenv("ADX_MIN", "15.0"))
+DOLLAR_VOL_MIN = float(os.getenv("DOLLAR_VOL_MIN", "5000000"))
+ATR_N = int(os.getenv("ATR_N", "14"))
+EMA_FAST = int(os.getenv("EMA_FAST", "20"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
+MOM_N = int(os.getenv("MOM_N", "63"))
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # Telegram Bot token
-CHAT_ID   = os.getenv("CHAT_ID")    # Telegram chat id (grupo o usuario)
-TELEGRAM_NOTIFY_EMPTY = os.getenv("TELEGRAM_NOTIFY_EMPTY", "false").lower() in ("1","true","yes")
+STATE_DIR = "/tmp/evolutivo_state"
+os.makedirs(STATE_DIR, exist_ok=True)
+LAST_PAYLOAD_PATH = os.path.join(STATE_DIR, "last_payload.json")
+LAST_DIGEST_PATH  = os.path.join(STATE_DIR, "last_top3_digest.txt")
 
-# ============================================================
-# Utilidades
-# ============================================================
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# ---------------------------- Imports dinámicos ---------------------------
+def _import_ranking():
+    try:
+        import ranking  # type: ignore
+        return ranking
+    except Exception as e:
+        logger.exception("No se pudo importar 'ranking'")
+        raise
 
-def _escape_html(text: str) -> str:
-    # Telegram parse_mode=HTML requiere escapar & < >
-    return (
-        text.replace("&", "&amp;")
+def _import_presend_rules():
+    try:
+        import presend_rules  # type: ignore
+        return presend_rules
+    except Exception:
+        return None
+
+# ---------------------------- Utilidades ----------------------------------
+def tg_escape(text: str) -> str:
+    """Escapa HTML para Telegram parse_mode=HTML (permitimos poner <b> en plantillas)."""
+    return (text
+            .replace("&", "&amp;")
             .replace("<", "&lt;")
-            .replace(">", "&gt;")
-    )
+            .replace(">", "&gt;"))
 
-def _fmt_price(v: Any) -> str:
+def _round(x: float, nd: int = 2) -> float:
     try:
-        if v is None:
-            return "—"
-        return f"{float(v):.4f}"
+        return round(float(x), nd)
     except Exception:
-        return str(v)
+        return float("nan")
 
-def _fmt_rr(v: Any) -> str:
+def _digest_for_signals(signals: List[Dict[str, Any]]) -> str:
+    """Digest determinístico de señales finales para dedupe (ticker, side, TG, SL, TP1, TP2)."""
+    key_items = []
+    for s in sorted(signals, key=lambda z: (z.get("ticker",""), z.get("side",""))):
+        key_items.append(f'{s.get("ticker")}:{s.get("side")}:{s.get("tg")}:{s.get("sl")}:{s.get("tp1")}:{s.get("tp2")}')
+    raw = "|".join(key_items)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+# ---------------------------- Indicadores ---------------------------------
+import pandas as pd
+
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    # Wilder smoothing: ATR_t = (ATR_{t-1}*(n-1) + TR_t)/n
+    atr = tr.ewm(alpha=1/n, adjust=False).mean()
+    return atr
+
+def _adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+
+    plus_dm = plus_dm.where((plus_dm > 0) & (plus_dm > -minus_dm), 0.0)
+    minus_dm = minus_dm.where((minus_dm > 0) & (minus_dm > -plus_dm), 0.0)
+
+    tr1 = (high - low).abs()
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1/n, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1/n, adjust=False).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/n, adjust=False).mean() / atr)
+    dx = ( (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA) ) * 100
+    adx = dx.ewm(alpha=1/n, adjust=False).mean()
+    return adx
+
+def _avg_dollar_vol(df: pd.DataFrame, n: int = 20) -> float:
+    dv = (df["Close"] * df["Volume"]).tail(n).mean()
+    return float(dv) if pd.notna(dv) else 0.0
+
+# ---------------------------- Datos en vivo -------------------------------
+def _get_live_df(ticker: str, period: str = "2y", interval: str = "1d") -> Optional[pd.DataFrame]:
     try:
-        if v is None:
-            return "—"
-        return f"{float(v):.1f}"
-    except Exception:
-        return str(v)
-
-def _persist_payload(payload: Dict[str, Any]) -> None:
-    payload = dict(payload)
-    payload["_persisted_at"] = _now_iso()
-    with LAST_JSON.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-def _load_last_payload() -> Optional[Dict[str, Any]]:
-    if not LAST_JSON.exists():
+        import yfinance as yf  # type: ignore
+    except Exception as e:
+        logger.error("yfinance no disponible: %s", e)
         return None
     try:
-        with LAST_JSON.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-def _write_last_signature(sig: str) -> None:
-    LAST_SIGN.write_text(sig, encoding="utf-8")
-
-def _read_last_signature() -> Optional[str]:
-    try:
-        return LAST_SIGN.read_text(encoding="utf-8").strip() if LAST_SIGN.exists() else None
-    except Exception:
-        return None
-
-def _hash_signature(approved_top3: List[Dict[str, Any]], as_of: Optional[str]) -> str:
-    # Firma estable basada en campos esenciales para evitar duplicados
-    payload = {
-        "as_of": as_of,
-        "approved_top3": [
-            {
-                "code": s.get("code"),
-                "ysymbol": s.get("ysymbol"),
-                "side": s.get("side"),
-                "strategy": s.get("strategy"),
-                "trigger": s.get("trigger"),
-                "sl": s.get("sl"),
-                "tp1": s.get("tp1"),
-                "tp2": s.get("tp2"),
-                "rr": s.get("rr"),
-            }
-            for s in (approved_top3 or [])
-        ],
-    }
-    b = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(b).hexdigest()
-
-# ============================================================
-# Enriquecimiento de niveles: TG, SL, TP1, TP2
-# ============================================================
-def _enrich_targets(s: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Asegura que cada señal tenga: trigger (TG), SL, TP1, TP2.
-    - Si ya vienen de presend_rules, se respetan.
-    - Si falta TP1/TP2, se calculan usando ATR y el trigger como entrada.
-    - Fórmula por defecto (simétrica y robusta):
-        LONG:  SL = TG - 1.20*ATR, TP1 = TG + 1.00*ATR, TP2 = TG + 1.90*ATR
-        SHORT: SL = TG + 1.20*ATR, TP1 = TG - 1.00*ATR, TP2 = TG - 1.90*ATR
-    - RR se mantiene tal como venga (basado en TP2), y si falta se calcula contra TP2.
-    """
-    out = dict(s)
-    side = (out.get("side") or "").lower().strip()
-    atr  = out.get("atr")
-    tg   = out.get("trigger")
-
-    # Si no hay trigger, usamos price si viene; si no, lo dejamos None
-    price = out.get("price") or out.get("entry") or out.get("close")
-    if tg is None:
-        tg = price
-
-    # Si falta ATR pero hay SL/TP, tratamos de inferir uno aproximado
-    def _to_float(x):
-        try:
-            return float(x)
-        except Exception:
+        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False, threads=False)
+        if df is None or df.empty:
+            logger.warning("Sin datos para %s", ticker)
             return None
+        df = df.dropna()
+        return df
+    except Exception as e:
+        logger.error("Error yfinance para %s: %s", ticker, e)
+        return None
 
-    tg_f  = _to_float(tg)
-    sl_f  = _to_float(out.get("sl"))
-    tp_f  = _to_float(out.get("tp"))  # algunos pipelines traen 'tp' único (lo tomamos como TP2)
-    tp1_f = _to_float(out.get("tp1"))
-    tp2_f = _to_float(out.get("tp2"))
-    atr_f = _to_float(atr)
+def _get_last_price(ticker: str, df: Optional[pd.DataFrame]) -> Optional[float]:
+    px = None
+    if df is not None and not df.empty:
+        try:
+            px = float(df["Close"].iloc[-1])
+        except Exception:
+            px = None
+    if px is None:
+        try:
+            import yfinance as yf  # type: ignore
+            t = yf.Ticker(ticker)
+            fi = getattr(t, "fast_info", None)
+            if fi and "last_price" in fi:
+                px = float(fi["last_price"])
+        except Exception:
+            pass
+    return px
 
-    # Si no hay ATR pero sí TG y SL o TP, inferimos ATR aproximado
-    if atr_f is None and tg_f is not None:
-        if sl_f is not None:
-            atr_f = abs(tg_f - sl_f) / 1.20
-        elif tp_f is not None:
-            atr_f = abs(tp_f - tg_f) / 1.90
+# ---------------------------- Fallback estricto ---------------------------
+def _analyze_one_ticker(ticker: str) -> Optional[Dict[str, Any]]:
+    df = _get_live_df(ticker, period="2y", interval="1d")
+    if df is None or df.empty or df.shape[0] < max(MOM_N+1, EMA_SLOW+1, ATR_N+1):
+        return {"ticker": ticker, "reason_excluded": "no_data"}
 
-    # Calculamos TP1/TP2 si faltan y hay side + TG + ATR
-    if tp1_f is None or tp2_f is None:
-        if side in ("long", "short") and tg_f is not None and atr_f is not None and atr_f > 0:
-            if side == "long":
-                tp1_f = tg_f + 1.00 * atr_f if tp1_f is None else tp1_f
-                tp2_f = tg_f + 1.90 * atr_f if tp2_f is None else tp2_f
-                sl_f  = tg_f - 1.20 * atr_f if sl_f  is None else sl_f
+    close = df["Close"]
+    ema_fast = _ema(close, EMA_FAST)
+    ema_slow = _ema(close, EMA_SLOW)
+    mom = close - close.shift(MOM_N)
+    atr = _atr(df, ATR_N)
+    adx = _adx(df, ATR_N)
+    dv = _avg_dollar_vol(df, n=20)
+
+    ema_ok = bool(ema_fast.iloc[-1] > ema_slow.iloc[-1])
+    mom_ok = bool(mom.iloc[-1] > 0)
+    adx_ok = bool(adx.iloc[-1] >= ADX_MIN)
+    liquid_ok = bool(dv >= DOLLAR_VOL_MIN)
+
+    side = None
+    if ema_ok and mom_ok:
+        side = "LONG"
+    elif (not ema_ok) and (not mom_ok):
+        side = "SHORT"
+    else:
+        # Condiciones mixtas => no señal clara
+        return {"ticker": ticker, "reason_excluded": "mixed_conditions"}
+
+    if not adx_ok:
+        return {"ticker": ticker, "reason_excluded": "adx_low"}
+    if not liquid_ok:
+        return {"ticker": ticker, "reason_excluded": "illiquid"}
+
+    tg = _get_last_price(ticker, df)
+    if tg is None:
+        return {"ticker": ticker, "reason_excluded": "no_price"}
+    atr_val = float(atr.iloc[-1])
+
+    # Niveles por ATR (ajustables)
+    if side == "LONG":
+        sl = tg - 1.20*atr_val
+        tp1 = tg + 1.00*atr_val
+        tp2 = tg + 1.90*atr_val
+        rr = (tp2 - tg) / max(tg - sl, 1e-9)
+    else:
+        sl = tg + 1.20*atr_val
+        tp1 = tg - 1.00*atr_val
+        tp2 = tg - 1.90*atr_val
+        rr = (tg - tp2) / max(sl - tg, 1e-9)
+
+    return {
+        "ticker": ticker,
+        "side": side,
+        "tg": round(tg, 2),
+        "sl": round(sl, 2),
+        "tp1": round(tp1, 2),
+        "tp2": round(tp2, 2),
+        "atr": round(atr_val, 2),
+        "rr": round(rr, 2),
+        "strategy": "EMA20/50 + MOM63 + ADX + ATR",
+    }
+
+def _fallback_build_signals(top3_tickers: List[str]) -> List[Dict[str, Any]]:
+    final = []
+    excluded = []
+    for tk in top3_tickers:
+        res = _analyze_one_ticker(tk)
+        if not res:
+            continue
+        if "reason_excluded" in res:
+            excluded.append([tk, res["reason_excluded"]])
+            continue
+        final.append(res)
+    return final
+
+# ---------------------------- Enriquecimiento -----------------------------
+def _enrich_targets(sig: Dict[str, Any]) -> Dict[str, Any]:
+    """Completa TG/SL/TP1/TP2/ATR/RR con ATR si faltan, usando datos en vivo."""
+    ticker = sig.get("ticker")
+    side = sig.get("side")
+    if not ticker:
+        return sig
+    df = _get_live_df(ticker, period="2y", interval="1d")
+    if df is None or df.empty:
+        return sig
+
+    atr_val = float(_atr(df, ATR_N).iloc[-1])
+    tg = sig.get("tg") or _get_last_price(ticker, df)
+    if tg is None:
+        return sig
+
+    need_levels = any(sig.get(k) is None for k in ("sl", "tp1", "tp2"))
+    if need_levels and side:
+        if side.upper() == "LONG":
+            sl = tg - 1.20*atr_val
+            tp1 = tg + 1.00*atr_val
+            tp2 = tg + 1.90*atr_val
+        else:
+            sl = tg + 1.20*atr_val
+            tp1 = tg - 1.00*atr_val
+            tp2 = tg - 1.90*atr_val
+        sig["sl"] = round(sl, 2)
+        sig["tp1"] = round(tp1, 2)
+        sig["tp2"] = round(tp2, 2)
+
+    # ATR y RR
+    sig["atr"] = round(atr_val, 2)
+    if "rr" not in sig or sig.get("rr") is None:
+        if side and all(k in sig for k in ("sl","tp2","tg")):
+            tg = float(sig["tg"])
+            sl = float(sig["sl"])
+            tp2 = float(sig["tp2"])
+            if side.upper() == "LONG":
+                rr = (tp2 - tg) / max(tg - sl, 1e-9)
             else:
-                tp1_f = tg_f - 1.00 * atr_f if tp1_f is None else tp1_f
-                tp2_f = tg_f - 1.90 * atr_f if tp2_f is None else tp2_f
-                sl_f  = tg_f + 1.20 * atr_f if sl_f  is None else sl_f
+                rr = (tg - tp2) / max(sl - tg, 1e-9)
+            sig["rr"] = round(rr, 2)
 
-    # Si no venía RR, lo calculamos respecto a TP2
-    rr_f = _to_float(out.get("rr"))
-    if rr_f is None and tg_f is not None and sl_f is not None and tp2_f is not None and (tg_f != sl_f):
-        rr_f = abs((tp2_f - tg_f) / (tg_f - sl_f))
+    return sig
 
-    # Asignamos salidas formateadas
-    out["trigger"] = tg_f if tg_f is not None else out.get("trigger")
-    out["sl"] = sl_f if sl_f is not None else out.get("sl")
-    out["tp1"] = tp1_f if tp1_f is not None else out.get("tp1")
-    out["tp2"] = tp2_f if tp2_f is not None else (tp_f if tp_f is not None else out.get("tp2"))
-    out["rr"] = rr_f if rr_f is not None else out.get("rr")
-    out["atr"] = atr_f if atr_f is not None else out.get("atr")
-    return out
+# ---------------------------- Telegram ------------------------------------
+import requests
 
-def _enrich_all(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [_enrich_targets(s) for s in (signals or [])]
+def _telegram_enabled() -> (bool, str):
+    if not TELEGRAM_ENABLED:
+        return False, "disabled_by_env"
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False, "missing_env(TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID)"
+    return True, "ok"
 
-# ============================================================
-# Mensaje para Telegram (HTML)
-# ============================================================
-def _format_tg_message(payload: Dict[str, Any]) -> str:
-    as_of = payload.get("as_of") or _now_iso()[:10]
-    approved = payload.get("approved_top3") or []
+def _format_signal_html(sig: Dict[str, Any], as_of: str) -> str:
+    t = tg_escape(str(sig.get("ticker","-")))
+    side = tg_escape(str(sig.get("side","-")))
+    strat = tg_escape(str(sig.get("strategy","")))
+    tg_px = sig.get("tg"); sl = sig.get("sl"); tp1 = sig.get("tp1"); tp2 = sig.get("tp2")
+    atr = sig.get("atr"); rr = sig.get("rr")
 
-    header = f"<b>Top 3 Señales</b>  <i>{_escape_html(as_of)}</i>\n"
-    if not approved:
-        body = "Sin señales aprobadas."
-        return header + body
-
-    lines = [header]
-    for i, s in enumerate(approved, 1):
-        code = _escape_html(s.get("code") or s.get("ysymbol") or "?")
-        side = _escape_html(s.get("side") or "?")
-        strat = _escape_html(s.get("strategy") or "?")
-        trig = _fmt_price(s.get("trigger"))
-        sl   = _fmt_price(s.get("sl"))
-        tp1  = _fmt_price(s.get("tp1"))
-        tp2  = _fmt_price(s.get("tp2"))
-        rr   = _fmt_rr(s.get("rr"))
-        atr  = _fmt_price(s.get("atr")) if ("atr" in s) else "—"
-
-        lines.append(
-            f"<b>{i}. {code}</b>  •  {side}  •  {strat}\n"
-            f"TG: <code>{trig}</code>  |  SL: <code>{sl}</code>  |  TP1: <code>{tp1}</code>  |  TP2: <code>{tp2}</code>  |  RR: <code>{rr}</code>\n"
-            f"ATR: <code>{atr}</code>"
-        )
-
-    # Preview Top50 (primeros 5) – opcional
-    top50 = payload.get("top50") or []
-    if top50:
-        def _code_of(x):
-            return _escape_html((x.get("code") or x.get("ysymbol") or x.get("symbol") or "?"))
-        preview = ", ".join(_code_of(x) for x in top50[:5])
-        lines.append(f"\n<b>Top50 (preview)</b>: {preview}")
-
+    lines = []
+    # Encabezado
+    emoji = "📈" if side.upper() == "LONG" else "📉"
+    lines.append(f"{emoji} <b>{t}</b> • {side}")
+    if strat:
+        lines.append(f"📌 Estrategia: {strat}")
+    # Niveles
+    def fnum(x): 
+        try: 
+            return f"{float(x):.2f}"
+        except Exception:
+            return "-"
+    lines.append(f"🎯 TG {fnum(tg_px)}  |  ⛔ SL {fnum(sl)}")
+    lines.append(f"🥇 TP1 {fnum(tp1)}  |  🥈 TP2 {fnum(tp2)}")
+    # Métricas
+    add = []
+    if atr is not None: add.append(f"ATR14 {fnum(atr)}")
+    if rr is not None: add.append(f"RR(TP2) {fnum(rr)}")
+    add.append(f"as_of {tg_escape(as_of)}")
+    lines.append(" · ".join(add))
     return "\n".join(lines)
 
-# ============================================================
-# Envío robusto a Telegram (requests -> httpx -> urllib)
-# ============================================================
-def _send_tg(text: str) -> Tuple[bool, str]:
-    if not BOT_TOKEN or not CHAT_ID:
-        return False, "missing_env(TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID)"
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+def _send_telegram_messages(signals: List[Dict[str, Any]], as_of: str, dedupe_ok: bool) -> Dict[str, Any]:
+    ok, reason = _telegram_enabled()
+    info = {"attempted": True, "enabled": ok, "tickers": [s.get("ticker") for s in signals]}
+    if not ok:
+        info["reason"] = reason
+        return {"notified": False, "notify_info": info}
 
-    last_err = "unknown"
-    # Try requests
+    # Dedupe por digest
+    digest = _digest_for_signals(signals)
+    info["digest"] = digest
+    if dedupe_ok:
+        try:
+            if os.path.exists(LAST_DIGEST_PATH):
+                last = open(LAST_DIGEST_PATH, "r").read().strip()
+                if last == digest:
+                    info["reason"] = "duplicate_digest"
+                    return {"notified": False, "notify_info": info}
+        except Exception:
+            pass
+
+    sent_all = True
+    status = 200
     try:
-        import requests  # type: ignore
-        r = requests.post(url, json=payload, timeout=20)
-        if r.status_code == 200:
-            return True, "ok"
-        return False, f"send_failed(status={r.status_code} body={r.text})"
+        for sig in signals:
+            msg = _format_signal_html(sig, as_of)
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
+            r = requests.post(url, json=payload, timeout=15)
+            if r.status_code != 200:
+                sent_all = False
+                status = r.status_code
+                info["reason"] = f"send_failed(status={r.status_code} body={r.text})"
+                logger.error("Telegram send failed: %s %s", r.status_code, r.text)
+        if sent_all:
+            with open(LAST_DIGEST_PATH, "w") as f:
+                f.write(digest)
     except Exception as e:
-        last_err = f"requests: {e!r}"
+        sent_all = False
+        status = 500
+        info["reason"] = f"send_exception({e})"
+        logger.exception("Telegram send exception")
 
-    # Try httpx
+    info["status"] = status
+    info["response"] = "ok" if sent_all else info.get("reason","send_partial")
+    return {"notified": sent_all, "notify_info": info}
+
+# ---------------------------- Persistencia --------------------------------
+def _persist_payload(payload: Dict[str, Any]) -> None:
     try:
-        import httpx  # type: ignore
-        with httpx.Client(timeout=20.0) as client:
-            r = client.post(url, json=payload)
-        if r.status_code == 200:
-            return True, "ok"
-        return False, f"send_failed(status={r.status_code} body={r.text})"
-    except Exception as e:
-        last_err = f"httpx: {e!r}"
+        with open(LAST_PAYLOAD_PATH, "w") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.exception("No se pudo persistir payload")
 
-    # Fallback urllib
+def _load_last_payload() -> Optional[Dict[str, Any]]:
     try:
-        import urllib.request
-        import urllib.error
-        req = urllib.request.Request(url, method="POST")
-        req.add_header("Content-Type", "application/json")
-        data = json.dumps(payload).encode("utf-8")
-        with urllib.request.urlopen(req, data, timeout=20) as resp:
-            if resp.status == 200:
-                return True, "ok"
-            return False, f"urllib status={resp.status}"
-    except Exception as e:
-        last_err = f"urllib: {e!r}"
+        if os.path.exists(LAST_PAYLOAD_PATH):
+            with open(LAST_PAYLOAD_PATH, "r") as f:
+                return json.load(f)
+    except Exception:
+        logger.exception("No se pudo leer payload previo")
+    return None
 
-    return False, last_err
+# ---------------------------- FastAPI -------------------------------------
+app = FastAPI(title="App Evolutivo", version="1.0.0")
 
-# ============================================================
-# FastAPI
-# ============================================================
-app = FastAPI(title="Evolutivo Signals API", version="1.1.0")
+def _ok_token(token: str) -> bool:
+    return token == API_TOKEN
+
+def _call_run_full_pipeline() -> Dict[str, Any]:
+    ranking = _import_ranking()
+    # Algunos módulos no aceptan kwargs 'audit'; probamos seguro
+    try:
+        # Intento con audit, si falla por TypeError, reintento sin audit
+        return ranking.run_full_pipeline(audit=False)  # type: ignore
+    except TypeError:
+        return ranking.run_full_pipeline()  # type: ignore
+
+def _use_presend_rules(payload: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    mod = _import_presend_rules()
+    if not mod:
+        return None
+    try:
+        if hasattr(mod, "build_top3_signals"):
+            return mod.build_top3_signals(payload)  # type: ignore
+    except Exception:
+        logger.exception("Error en presend_rules.build_top3_signals")
+    return None
 
 @app.get("/healthz")
 def healthz():
+    ok, reason = _telegram_enabled()
+    last_digest = None
+    try:
+        if os.path.exists(LAST_DIGEST_PATH):
+            last_digest = open(LAST_DIGEST_PATH).read().strip()
+    except Exception:
+        pass
     return {
         "ok": True,
-        "telegram_enabled": bool(BOT_TOKEN and CHAT_ID),
-        "data_dir": str(DATA_DIR),
-        "has_last": LAST_JSON.exists(),
-        "time": _now_iso(),
+        "time": datetime.now(timezone.utc).isoformat(),
+        "telegram_enabled": ok,
+        "telegram_reason": reason if not ok else "ok",
+        "has_last_payload": os.path.exists(LAST_PAYLOAD_PATH),
+        "last_digest": last_digest,
+        "version": "1.0.0"
     }
 
 @app.get("/signals/status")
 def signals_status():
-    last = _load_last_payload()
+    p = _load_last_payload()
+    if not p:
+        return {"ok": True, "has_payload": False}
     return {
         "ok": True,
-        "has_last": last is not None,
-        "last_as_of": (last or {}).get("as_of"),
-        "telegram_enabled": bool(BOT_TOKEN and CHAT_ID),
+        "has_payload": True,
+        "as_of": p.get("as_of"),
+        "top3_tickers": [s.get("ticker") for s in p.get("final_signals", [])],
+        "digest": _digest_for_signals(p.get("final_signals", [])),
     }
 
 @app.get("/signals/top3")
-def get_last_top3():
-    last = _load_last_payload()
-    if not last:
-        raise HTTPException(404, "Aún no hay resultados. Ejecuta /signals/run-top3")
-    return JSONResponse(last)
+def signals_top3():
+    p = _load_last_payload()
+    if not p:
+        return {"ok": True, "has_payload": False}
+    return p
 
-# --- ENDPOINT ÚNICO: ejecuta TODO y (opcional) envía Telegram ---
 @app.get("/signals/run-top3")
-def run_all(
-    token: str = Query(..., description="Root token (p.ej. 123)"),
-    send_tg: bool = Query(True, description="Si True, envía a Telegram al finalizar"),
-    dedupe_tg: bool = Query(True, description="Evita duplicados (no envía si no hay cambios)")
+def run_top3(
+    token: str = Query(...),
+    send_tg: bool = Query(True),
+    dedupe_tg: bool = Query(True),
 ):
-    if token != RUN_TOKEN:
-        raise HTTPException(status_code=403, detail="Token inválido")
+    if not _ok_token(token):
+        raise HTTPException(status_code=403, detail="bad token")
 
-    # 1) Ejecutar pipeline (Top50 + factores Top3)
-    payload = run_full_pipeline()  # dict con keys: top50, top3_factors, as_of, etc.
+    t0 = time.time()
+    # 1) Ejecutar ranking
+    payload = _call_run_full_pipeline()
+    as_of = payload.get("as_of") or datetime.utcnow().date().isoformat()
 
-    # 2) Construir señales finales (aplican TODOS los filtros internos)
-    top3_factors = payload.get("top3_factors") or []
-    approved_top3, rejected_top3 = build_top3_signals(top3_factors, as_of=payload.get("as_of"))
+    # 2) Intentar construir señales con presend_rules
+    final_signals: Optional[List[Dict[str, Any]]] = None
+    try:
+        final_signals = _use_presend_rules(payload)
+    except Exception:
+        final_signals = None
 
-    # 3) Enriquecer con TG/SL/TP1/TP2 y recalcular RR si falta
-    approved_top3 = _enrich_all(approved_top3)
+    # 3) Fallback estricto si no hay señales válidas
+    diag = payload.get("diag", {}).copy() if isinstance(payload.get("diag"), dict) else {}
+    if not final_signals:
+        top3_factors = payload.get("top3_factors") or []
+        top3_tickers = [x.get("ticker") if isinstance(x, dict) else x for x in top3_factors]
+        top3_tickers = [t for t in top3_tickers if t] or (payload.get("top50", [])[:3])
+        final_signals = _fallback_build_signals(top3_tickers)
+        diag["fallback_used"] = True
+    else:
+        diag["fallback_used"] = False
 
-    # 4) Armar payload final y persistir
-    payload["approved_top3"] = approved_top3
-    payload["rejected_top3"] = rejected_top3
-    _persist_payload(payload)
+    # 4) Enriquecer niveles/ATR/RR de forma robusta
+    enriched_signals = []
+    for s in final_signals:
+        enriched_signals.append(_enrich_targets(s.copy()))
+    final_signals = enriched_signals
 
-    # 5) Notificación (opcional) — SIEMPRE después de TODOS los filtros
-    notified = False
-    notify_info: Dict[str, Any] = {"attempted": False, "enabled": bool(BOT_TOKEN and CHAT_ID), "tickers": [s.get("code") or s.get("ysymbol") for s in approved_top3]}
-
-    if send_tg:
-        notify_info["attempted"] = True
-
-        # Dedupe por firma del contenido (evita repetir si no hubo cambios)
-        sig = _hash_signature(approved_top3, payload.get("as_of"))
-        last_sig = _read_last_signature()
-
-        if dedupe_tg and last_sig == sig:
-            notify_info.update({"dedupe_check": "duplicate_skipped"})
-        else:
-            # Construir mensaje
-            text = _format_tg_message(payload)
-
-            # Si no hay aprobadas y NO queremos notificar vacíos, salteamos
-            if not approved_top3 and not TELEGRAM_NOTIFY_EMPTY:
-                notify_info.update({"reason": "empty_and_notify_false"})
-            else:
-                ok, info = _send_tg(text)
-                notify_info.update({"status": 200 if ok else 500, "response": info})
-                if ok:
-                    notified = True
-                    _write_last_signature(sig)
-
-    return JSONResponse({
+    # 5) Persistencia para auditoría y dedupe
+    out = {
         "ok": True,
-        "took_s": None,  # el timing lo maneja tu infra de logs
-        "as_of": payload.get("as_of"),
-        "top50": [x.get("code") or x.get("ysymbol") or x.get("symbol") for x in (payload.get("top50") or [])][:50],
-        "top3_factors": payload.get("top3_factors"),
-        "approved_top3": approved_top3,
-        "rejected_top3": rejected_top3,
-        "notified": notified,
-        "notify_info": notify_info,
-    })
+        "took_s": round(time.time() - t0, 2),
+        "as_of": as_of,
+        "top50": payload.get("top50", [])[:50],
+        "top3_factors": payload.get("top3_factors", [])[:3],
+        "diag": diag,
+        "final_signals": final_signals,
+        "notified": False,
+    }
+
+    # 6) Envío a Telegram (solo approved_top3 / final_signals)
+    notify_info = {"attempted": False}
+    if send_tg and final_signals:
+        ret = _send_telegram_messages(final_signals, as_of, dedupe_ok=dedupe_tg)
+        out["notified"] = ret.get("notified", False)
+        notify_info = ret.get("notify_info", notify_info)
+    else:
+        notify_info["reason"] = "send_tg_false_or_empty_signals"
+    out["notify_info"] = notify_info
+
+    _persist_payload(out)
+    logger.info("Pipeline listo · as_of=%s · top50=%s · top3_factors=%s · %.2fs",
+                as_of, len(out["top50"]), len(out["top3_factors"]), out["took_s"])
+    return JSONResponse(out)
+
+# Compat anterior
+@app.get("/rank/run-top3")
+def run_top3_compat(token: str = Query(...), send_tg: bool = Query(True), dedupe_tg: bool = Query(True)):
+    # Reutiliza la misma lógica
+    return run_top3(token=token, send_tg=send_tg, dedupe_tg=dedupe_tg)
