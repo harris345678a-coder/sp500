@@ -1,294 +1,276 @@
 
 # app_evolutivo.py
-# FastAPI con envío robusto a Telegram del Top 3 (sin saltarse filtros),
-# tolerancia a la firma de ranking.run_full_pipeline, deduplicación,
-# y logging profesional.
-from __future__ import annotations
+# FastAPI app para ejecutar el pipeline de ranking y notificar el TOP3 a Telegram
+# Diseño robusto: sin dependencias externas raras para el envío (usa requests si está,
+# y si no, fallback a urllib). Evita errores de "parse entities" en Telegram enviando
+# TEXTO PLANO por defecto y con reintentos controlados.
 
-import inspect
-import logging
 import os
-import time
 import json
+import time
 import hashlib
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Tuple
+import logging
+from typing import Any, Dict, List, Optional
 
-import requests
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
-
-# ------------------------------------------------------------------
-# Helpers de entorno
-# ------------------------------------------------------------------
-def _env(name: str, default: str = "") -> str:
-    return os.getenv(name, default)
-
-DEBUG = _env("DEBUG", "0").lower() in {"1", "true", "yes", "on"}
-LOG_LEVEL = _env("LOG_LEVEL", "DEBUG" if DEBUG else "INFO").upper()
-
-# ------------------------------------------------------------------
-# Configuración de logging
-# ------------------------------------------------------------------
-_LEVEL = getattr(logging, LOG_LEVEL, logging.INFO)
+# --- Logging base (silencioso por defecto) ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=_LEVEL,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("app_evolutivo")
 
-# Silenciar librerías ruidosas salvo que DEBUG=1
-for _lib in ["yfinance", "urllib3", "peewee", "requests", "httpx", "uvicorn", "gunicorn", "asyncio"]:
-    logging.getLogger(_lib).setLevel(logging.DEBUG if DEBUG else logging.WARNING)
-
-# ------------------------------------------------------------------
-# Carga de ranking.run_full_pipeline con tolerancia a firma
-# ------------------------------------------------------------------
+# --- Carga módulo de ranking ---
 try:
-    from ranking import run_full_pipeline as _run_full_pipeline  # type: ignore
-    RANKING_IMPORTED = True
-    log.debug("Importado ranking.run_full_pipeline correctamente.")
-except Exception as e:  # pragma: no cover
-    RANKING_IMPORTED = False
-    _IMPORT_ERROR = e
-    _run_full_pipeline = None  # type: ignore
-    log.exception("No se pudo importar run_full_pipeline desde ranking.py")
+    import ranking  # se asume 'ranking.py' está junto al app
+except Exception as e:
+    log.exception("No se pudo importar 'ranking'.")
+    raise
 
-def _supports_audit_kwarg() -> bool:
-    if not RANKING_IMPORTED or _run_full_pipeline is None:
-        return False
+# --- FastAPI app ---
+try:
+    from fastapi import FastAPI, HTTPException, Query
+    from fastapi.responses import JSONResponse
+except Exception as e:
+    log.exception("FastAPI no está disponible en el entorno.")
+    raise
+
+app = FastAPI(title="App Evolutivo", version="1.0.0")
+
+# ---- Utilidades generales ----
+
+
+def _dedupe_ordered(seq: List[Any]) -> List[Any]:
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+def _now_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def _digest_for(items: List[str]) -> str:
+    msg = "|".join(items).encode("utf-8")
+    return hashlib.sha256(msg).hexdigest()
+
+def _read_last_digest(state_dir: str) -> Optional[str]:
     try:
-        sig = inspect.signature(_run_full_pipeline)  # type: ignore[arg-type]
-        # Acepta **kwargs
-        if any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
-            return True
-        # Acepta 'audit' explícito
-        return "audit" in sig.parameters
+        p = os.path.join(state_dir, "last_top3_digest.txt")
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
     except Exception:
-        return False
+        pass
+    return None
 
-def _safe_run_full_pipeline(audit: bool) -> Dict[str, Any]:
-    if not RANKING_IMPORTED or _run_full_pipeline is None:
-        raise RuntimeError(f"ranking.run_full_pipeline no disponible: {_IMPORT_ERROR!r}")
-    if _supports_audit_kwarg():
-        return _run_full_pipeline(audit=audit)  # type: ignore[misc]
-    else:
-        return _run_full_pipeline()  # type: ignore[misc]
-
-# ------------------------------------------------------------------
-# Dedupe + envío a Telegram
-# ------------------------------------------------------------------
-def _extract_top3(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # Solo señales que YA pasaron por todos los filtros del pipeline.
-    top3 = payload.get("top3_factors") or payload.get("top3") or []
-    # Normalizar a lista de dicts con 'ticker' y 'reasons'
-    norm = []
-    for x in top3:
-        if isinstance(x, dict) and "ticker" in x:
-            reasons = x.get("reasons")
-            if isinstance(reasons, (list, tuple)):
-                reasons = list(reasons)
-            elif reasons is None:
-                reasons = []
-            else:
-                reasons = [str(reasons)]
-            norm.append({"ticker": str(x["ticker"]), "reasons": reasons})
-    return norm
-
-def _signature(top3: List[Dict[str, Any]], as_of: str | None) -> str:
-    tickers = ",".join([t["ticker"] for t in top3])
-    base = f"{as_of or ''}|{tickers}"
-    return hashlib.sha256(base.encode("utf-8")).hexdigest()
-
-def _state_path() -> str:
-    return _env("TOP3_STATE_PATH", "/tmp/top3_last.json")
-
-def _load_state() -> Dict[str, Any]:
-    path = _state_path()
+def _write_last_digest(state_dir: str, digest: str) -> None:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        os.makedirs(state_dir, exist_ok=True)
+        p = os.path.join(state_dir, "last_top3_digest.txt")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(digest)
     except Exception:
-        return {}
+        log.warning("No pude persistir el digest en %s", state_dir)
 
-def _save_state(state: Dict[str, Any]) -> None:
-    path = _state_path()
+# ---- Telegram ----
+
+def _http_post(url: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    # Intenta con requests primero, luego urllib.
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False)
-    except Exception as e:  # pragma: no cover
-        log.warning("No pude guardar estado de dedupe en %s: %r", path, e)
-
-def _should_send(sig: str, min_minutes: int) -> Tuple[bool, str]:
-    state = _load_state()
-    last_hash = state.get("last_hash")
-    last_sent_at = state.get("last_sent_at")
-    if last_hash and last_sent_at and last_hash == sig:
+        import requests  # type: ignore
+        resp = requests.post(url, data=data, timeout=10)
+        return {"status": resp.status_code, "text": resp.text}
+    except Exception as e:
+        import urllib.request
+        import urllib.parse
         try:
-            last_dt = datetime.fromisoformat(last_sent_at)
-        except Exception:
-            last_dt = datetime.now(timezone.utc) - timedelta(days=1)
-        elapsed = datetime.now(timezone.utc) - last_dt
-        if elapsed < timedelta(minutes=min_minutes):
-            return False, f"duplicate_recent({int(elapsed.total_seconds())}s ago)"
-    return True, "ok_to_send"
+            encoded = urllib.parse.urlencode(data).encode("utf-8")
+            with urllib.request.urlopen(url, data=encoded, timeout=10) as resp:
+                body = resp.read().decode("utf-8")
+                return {"status": getattr(resp, "status", 200), "text": body}
+        except Exception as e2:
+            return {"status": 0, "text": f"exception: {e!r} / {e2!r}"}
 
-def _save_sent(sig: str, top3: List[Dict[str, Any]], as_of: str | None) -> None:
-    _save_state({
-        "last_hash": sig,
-        "last_sent_at": datetime.now(timezone.utc).isoformat(),
-        "as_of": as_of,
-        "tickers": [t["ticker"] for t in top3],
-    })
+def _escape_markdown_v2(s: str) -> str:
+    # Escapa todos los caracteres especiales de MarkdownV2 según la doc de Telegram.
+    chars = r'_*[]()~`>#+-=|{}.!'
+    out = []
+    for ch in s:
+        if ch in chars:
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
 
-def _build_message(as_of: str | None, top3: List[Dict[str, Any]], top50_count: int | None) -> str:
-    header = f"📈 Top 3 señales (as_of={as_of})"
-    lines = [header, ""]
-    for i, item in enumerate(top3, 1):
-        reasons = ", ".join(item.get("reasons") or [])
-        lines.append(f"{i}) *{item['ticker']}* — {reasons}")
-    if top50_count is not None:
+def _build_top3_message(as_of: str, top3: List[Dict[str, Any]], diag: Dict[str, Any]) -> str:
+    # Mensaje en TEXTO PLANO. Evita parse_mode para impedir errores de "parse entities".
+    lines = []
+    lines.append(f"TOP 3 — {as_of}")
+    for i, item in enumerate(top3, start=1):
+        tk = item.get("ticker", "?")
+        reasons = item.get("reasons", [])
+        rs = ", ".join(map(str, reasons))
+        lines.append(f"{i}) {tk} — {rs}")
+    # Datos de universo si están disponibles
+    ucount = diag.get("universe_count")
+    fcount = diag.get("fetched_count")
+    excount = diag.get("excluded_count")
+    if any(x is not None for x in [ucount, fcount, excount]):
         lines.append("")
-        lines.append(f"Universo filtrado: {top50_count} candidatos")
+        details = []
+        if ucount is not None: details.append(f"universo={ucount}")
+        if fcount is not None: details.append(f"fetched={fcount}")
+        if excount is not None: details.append(f"excluidos={excount}")
+        lines.append(" | ".join(details))
     return "\n".join(lines)
 
-def _telegram_send(text: str) -> Tuple[bool, str]:
-    token = _env("TELEGRAM_BOT_TOKEN")
-    chat_id = _env("TELEGRAM_CHAT_ID")
+def send_telegram_top3(as_of: str, top3: List[Dict[str, Any]], diag: Dict[str, Any]) -> Dict[str, Any]:
+    info: Dict[str, Any] = {"attempted": False, "enabled": False}
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    enabled = os.getenv("TELEGRAM_ENABLED", "1").strip() not in ("0", "false", "False", "")
+    info["enabled"] = enabled
+
+    if not enabled:
+        info["reason"] = "disabled_by_env"
+        return info
+
     if not token or not chat_id:
-        return False, "missing_env(TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID)"
+        info["attempted"] = False
+        info["reason"] = "missing_env(TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID)"
+        return info
+
+    # Solo intentamos enviar si hay al menos 1 señal
+    if not top3:
+        info["attempted"] = False
+        info["reason"] = "no_top3"
+        return info
+
+    # Dedupe por digest en un directorio de estado
+    state_dir = os.getenv("STATE_DIR", "/tmp")
+    tickers = [str(x.get("ticker", "")) for x in top3]
+    digest = _digest_for(tickers)
+    info["tickers"] = tickers
+
+    last = _read_last_digest(state_dir)
+    if last == digest:
+        info["attempted"] = False
+        info["reason"] = "duplicate_already_sent"
+        info["dedupe_check"] = "duplicate_blocked"
+        return info
+    info["dedupe_check"] = "ok_to_send"
+
+    # Construye texto (PLANO por defecto)
+    text_plain = _build_top3_message(as_of, top3, diag)
+
+    # Primer intento: TEXTO PLANO sin parse_mode (robusto)
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
+        "text": text_plain,
         "disable_web_page_preview": True,
     }
-    backoffs = [0.5, 1.0, 2.0]
-    last_err = None
-    for b in backoffs:
-        try:
-            r = requests.post(url, json=payload, timeout=10)
-            if r.ok and r.json().get("ok"):
-                return True, "sent"
-            last_err = f"status={r.status_code} body={r.text[:200]}"
-        except Exception as e:
-            last_err = repr(e)
-        time.sleep(b)
-    return False, f"send_failed({last_err})"
 
-# ------------------------------------------------------------------
-# FastAPI
-# ------------------------------------------------------------------
-app = FastAPI(title="Ranking Evolutivo", version="1.1.0")
+    info["attempted"] = True
+    resp = _http_post(url, payload)
+    status = resp.get("status", 0)
+    body = resp.get("text", "")
+
+    if status == 200:
+        _write_last_digest(state_dir, digest)
+        info["status"] = status
+        info["response"] = "ok"
+        return info
+
+    # Si falló por parseo (raro al ser texto plano), reintenta con MarkdownV2 escapado
+    parse_error_mark = "can't parse entities"
+    if parse_error_mark in body.lower():
+        escaped = _escape_markdown_v2(text_plain)
+        payload_md = {
+            "chat_id": chat_id,
+            "text": escaped,
+            "parse_mode": "MarkdownV2",
+            "disable_web_page_preview": True,
+        }
+        resp2 = _http_post(url, payload_md)
+        status2 = resp2.get("status", 0)
+        body2 = resp2.get("text", "")
+        if status2 == 200:
+            _write_last_digest(state_dir, digest)
+            info["status"] = status2
+            info["response"] = "ok_after_escape"
+            return info
+        info["status"] = status2
+        info["response"] = f"send_failed_after_escape({status2} {body2})"
+        return info
+
+    info["status"] = status
+    info["response"] = f"send_failed(status={status} body={body})"
+    return info
+
+# ---- Endpoints ----
 
 @app.get("/healthz")
 def healthz() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "ranking_imported": RANKING_IMPORTED,
-        "supports_audit_kwarg": _supports_audit_kwarg(),
-    }
-
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "msg": "Usa /rank/run-top3?token=...&audit=0|1",
-        "endpoints": ["/healthz", "/rank/run-top3"],
-    }
-
-def _boolish(value: str | None, default: bool) -> bool:
-    if value is None:
-        return default
-    v = value.strip().lower()
-    if v in {"1", "true", "yes", "y", "on"}:
-        return True
-    if v in {"0", "false", "no", "n", "off"}:
-        return False
-    return default
-
-def _summary(payload: Dict[str, Any]) -> tuple[str | None, int, int]:
-    as_of = payload.get("as_of")
-    top50 = payload.get("top50") or []
-    top3 = payload.get("top3_factors") or payload.get("top3") or []
-    return as_of, (len(top50) if isinstance(top50, (list, tuple)) else 0), (
-        len(top3) if isinstance(top3, (list, tuple)) else 0
-    )
+    return {"ok": True, "ts": _now_iso()}
 
 @app.get("/rank/run-top3")
-def run_top3(
-    token: str = Query(..., description="Token de seguridad"),
-    audit: str | None = Query(None, description="1/true para activar auditoría de datos"),
-) -> JSONResponse:
-    expected = _env("APP_TOKEN", "123")
-    if not expected or token != expected:
-        log.warning("Token inválido en /rank/run-top3")
-        raise HTTPException(status_code=401, detail="token inválido")
+def run_top3(token: Optional[str] = Query(default=None)) -> JSONResponse:
+    # Autorización básica por token (opcional)
+    required = os.getenv("API_TOKEN", "123")
+    if required and (token or "") != required:
+        raise HTTPException(status_code=401, detail="invalid token")
 
-    audit_default = _boolish(_env("AUDIT_DEFAULT", "0"), False)
-    want_audit = _boolish(audit, audit_default)
+    t0 = time.time()
+    result: Dict[str, Any] = {}
 
-    t0 = time.perf_counter()
+    # Ejecuta pipeline sin kwargs no soportados (robusto vs cambios de firma)
     try:
-        payload = _safe_run_full_pipeline(audit=want_audit)
-    except TypeError as te:
-        # Si aun así hubiera un TypeError por 'audit', reintenta sin audit.
-        log.error("TypeError al invocar run_full_pipeline(audit=?). Reintentando sin 'audit'.")
-        log.debug("Detalle TypeError: %r", te)
-        payload = _safe_run_full_pipeline(audit=False)
-    except Exception as e:  # pragma: no cover
-        log.exception("Fallo ejecutando pipeline")
-        raise HTTPException(status_code=500, detail=f"pipeline error: {e!r}")
+        payload = ranking.run_full_pipeline()  # debe devolver dict con top50/top3_factors/diag/...
+    except TypeError as e:
+        # Si el proyecto viejo esperara kwargs, reintenta con detección
+        log.warning("run_full_pipeline() TypeError: %r", e)
+        try:
+            payload = ranking.run_full_pipeline()  # llamada simple
+        except Exception as e2:
+            log.exception("Fallo irrecuperable ejecutando run_full_pipeline().")
+            raise HTTPException(status_code=500, detail=f"pipeline_error: {e2!r}")
+    except Exception as e:
+        log.exception("Fallo ejecutando run_full_pipeline().")
+        raise HTTPException(status_code=500, detail=f"pipeline_error: {e!r}")
 
-    took = time.perf_counter() - t0
-    if "ok" not in payload:
-        payload["ok"] = True
-    payload["took_s"] = round(float(payload.get("took_s", took)), 2)
+    as_of = str(payload.get("as_of", ""))
+    top50 = payload.get("top50", []) or []
+    # dedupe preservando orden, sin alterar el payload original
+    top50 = _dedupe_ordered(top50)
+    top3 = payload.get("top3_factors", []) or []
+    # dedupe por ticker en top3
+    _seen_tk = set()
+    _top3_dedup = []
+    for item in top3:
+        tk = str(item.get("ticker", ""))
+        if tk and tk not in _seen_tk:
+            _seen_tk.add(tk)
+            _top3_dedup.append(item)
+    top3 = _top3_dedup
+    diag  = payload.get("diag", {}) or {}
 
-    # Resumen
-    as_of, n50, n3 = _summary(payload)
-    log.info("Pipeline listo · as_of=%s · top50=%s · top3_factors=%s · %.2fs", as_of, n50, n3, took)
+    # Notificar a Telegram (robusto)
+    notify_info = send_telegram_top3(as_of, top3, diag)
+    notified = notify_info.get("response", "").startswith("ok")
 
-    # --------------------------------------------------------------
-    # Envío a Telegram: SOLO si hay señales que YA pasaron filtros.
-    # Sin duplicados y con ventana mínima de reenvío.
-    # --------------------------------------------------------------
-    top3 = _extract_top3(payload)
-    tele_enabled = _env("TELEGRAM_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
-    min_minutes = int(_env("TOP3_MIN_RENOTIFY_MINUTES", "360"))  # 6h por defecto
-
-    notify_info: Dict[str, Any] = {
-        "attempted": False,
-        "enabled": tele_enabled,
-        "reason": None,
-        "tickers": [x["ticker"] for x in top3],
+    t1 = time.time()
+    result = {
+        "ok": True,
+        "took_s": round(t1 - t0, 2),
+        "as_of": as_of,
+        "top50": top50[:50],  # garantizar máx 50
+        "top3_factors": top3[:3],
+        "diag": diag,
+        "notified": notified,
+        "notify_info": notify_info,
     }
-
-    if tele_enabled and top3:
-        sig = _signature(top3, as_of)
-        ok_to_send, why = _should_send(sig, min_minutes)
-        notify_info["dedupe_check"] = why
-        if ok_to_send:
-            text = _build_message(as_of, top3, n50)
-            sent, reason = _telegram_send(text)
-            notify_info["attempted"] = True
-            notify_info["reason"] = reason
-            if sent:
-                _save_sent(sig, top3, as_of)
-                payload["notified"] = True
-            else:
-                payload["notified"] = False
-        else:
-            notify_info["reason"] = why
-            payload["notified"] = False
-    else:
-        if not tele_enabled:
-            notify_info["reason"] = "telegram_disabled"
-        elif not top3:
-            notify_info["reason"] = "no_signals"
-        payload["notified"] = False
-
-    payload["notify_info"] = notify_info
-
-    return JSONResponse(payload)
+    return JSONResponse(result)
