@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 App Evolutivo - Versión Profesional y Robusta
@@ -143,35 +144,39 @@ def _atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     return _rma(tr, length)
 
 def _adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    """Implementación robusta del indicador ADX."""
+    """Implementación robusta del indicador ADX usando métodos idiomáticos de Pandas."""
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
     close = df["Close"].astype(float)
 
-    # Movimiento direccional
-    up = high.diff()
-    down = -low.diff()
-
-    # Movimientos direccionales positivos y negativos
-    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
-    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
-    
-    # ATR (Wilder's smoothing)
+    # True Range
     tr = pd.concat([
         high - low,
         (high - close.shift(1)).abs(),
         (low - close.shift(1)).abs()
     ], axis=1).max(axis=1)
     atr = _rma(tr, length)
-
-    # Indicadores direccionales
-    with np.errstate(divide='ignore', invalid='ignore'):
-        plus_di = 100.0 * (_rma(plus_dm, length) / atr)
-        minus_di = 100.0 * (_rma(minus_dm, length) / atr)
-        # Índice de movimiento direccional (DX)
-        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di)
     
-    # Índice direccional promedio (ADX)
+    # Directional Movement
+    up = high.diff()
+    down = -low.diff()
+    
+    # Usa .where() de Pandas para un cálculo más robusto que np.where
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    
+    plus_dm_rma = _rma(plus_dm, length)
+    minus_dm_rma = _rma(minus_dm, length)
+
+    # Directional Indicators
+    with np.errstate(divide='ignore', invalid='ignore'):
+        plus_di = 100.0 * (plus_dm_rma / atr)
+        minus_di = 100.0 * (minus_dm_rma / atr)
+        di_sum = plus_di + minus_di
+        
+        # Previene división por cero explícitamente
+        dx = 100.0 * (plus_di - minus_di).abs() / di_sum.replace(0, np.nan)
+    
     adx = _rma(dx.fillna(0), length)
     return adx
 
@@ -325,7 +330,7 @@ def send_telegram_notification(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
 # 7. ORQUESTADOR PRINCIPAL Y ENDPOINTS DE API
 # ==============================================================================
 
-app = FastAPI(title="App Evolutivo Pro", version="2.1.0")
+app = FastAPI(title="App Evolutivo Pro", version="2.2.0")
 
 def run_and_notify_pipeline() -> Dict[str, Any]:
     """
@@ -411,5 +416,4 @@ def run_top3_endpoint(token: Optional[str] = Query(default=None, description="AP
     except Exception as e:
         log.critical("An unhandled exception occurred during pipeline execution: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
-
 
