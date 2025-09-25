@@ -143,20 +143,37 @@ def _atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     return _rma(tr, length)
 
 def _adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high, low, close = df["High"].astype(float), df["Low"].astype(float), df["Close"].astype(float)
-    prev_high, prev_low = high.shift(1), low.shift(1)
-    plus_dm = (high - prev_high).where((high - prev_high) > (prev_low - low), 0.0).where((high-prev_high) > 0, 0.0)
-    minus_dm = (prev_low - low).where((prev_low - low) > (high - prev_high), 0.0).where((prev_low-low) > 0, 0.0)
+    """Implementación robusta del indicador ADX."""
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
+
+    # Movimiento direccional
+    up = high.diff()
+    down = -low.diff()
+
+    # Movimientos direccionales positivos y negativos
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
     
-    tr_raw = pd.concat([(high - low), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-    tr_rma = _rma(tr_raw, length)
-    
+    # ATR (Wilder's smoothing)
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs()
+    ], axis=1).max(axis=1)
+    atr = _rma(tr, length)
+
+    # Indicadores direccionales
     with np.errstate(divide='ignore', invalid='ignore'):
-        plus_di = 100.0 * (_rma(plus_dm, length) / tr_rma)
-        minus_di = 100.0 * (_rma(minus_dm, length) / tr_rma)
+        plus_di = 100.0 * (_rma(plus_dm, length) / atr)
+        minus_di = 100.0 * (_rma(minus_dm, length) / atr)
+        # Índice de movimiento direccional (DX)
         dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di)
     
-    return _rma(dx.fillna(0), length)
+    # Índice direccional promedio (ADX)
+    adx = _rma(dx.fillna(0), length)
+    return adx
 
 
 def _analyze_one_ticker(ticker: str) -> Optional[Dict[str, Any]]:
