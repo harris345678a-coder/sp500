@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 App Evolutivo - Versión Profesional y Robusta
