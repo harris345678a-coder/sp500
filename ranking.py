@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ranking.py - Módulo de Escaneo y Ranking de Mercado v2.1.0
+ranking.py - Módulo de Escaneo y Ranking de Mercado v2.2.0
 ---------------------------------------------------------------------
 Este módulo es responsable de analizar un universo de activos financieros,
 calcular indicadores técnicos clave y rankearlos para identificar las
@@ -8,7 +8,7 @@ mejores oportunidades de trading.
 
 Diseño Robusto y Profesional:
 - Obtención de datos a prueba de fallos con reintentos y backoff.
-- Cálculo de indicadores robusto que maneja datos faltantes (NaNs).
+- Cálculo de indicadores de grado industrial, robusto contra NaNs y errores.
 - Análisis tolerante a fallos para garantizar que el pipeline siempre se complete.
 - Configuración flexible a través de variables de entorno.
 - Lógica clara y modular para fácil mantenimiento.
@@ -92,41 +92,52 @@ def _rma(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(alpha=1.0 / float(length), adjust=False).mean()
 
 def _atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high, low, close = df["High"].astype(float), df["Low"].astype(float), df["Close"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
     tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
     return _rma(tr, length)
 
 def _adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
     """
-    Implementación robusta del indicador ADX que garantiza una salida de una sola columna.
+    Implementación de ADX de grado industrial, robusta y a prueba de fallos.
+    Garantiza una salida de una sola columna (pd.Series).
     """
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
-    close = df["Close"].astype(float)
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    
+    # Movimiento Direccional
+    move_up = high.diff()
+    move_down = low.diff().mul(-1)
+    
+    plus_dm = pd.Series(
+        np.where((move_up > move_down) & (move_up > 0), move_up, 0.0),
+        index=df.index
+    )
+    minus_dm = pd.Series(
+        np.where((move_down > move_up) & (move_down > 0), move_down, 0.0),
+        index=df.index
+    )
 
+    # True Range
     tr = pd.concat([
         high - low,
         (high - close.shift(1)).abs(),
         (low - close.shift(1)).abs()
     ], axis=1).max(axis=1)
+    
+    # Suavizado Wilder (RMA)
     atr = _rma(tr, length)
+    plus_di = 100 * (_rma(plus_dm, length) / atr.replace(0, np.nan))
+    minus_di = 100 * (_rma(minus_dm, length) / atr.replace(0, np.nan))
     
-    up = high.diff()
-    down = -low.diff()
-    
-    plus_dm = up.where((up > down) & (up > 0), 0.0)
-    minus_dm = down.where((down > up) & (down > 0), 0.0)
-    
-    plus_dm_rma = _rma(plus_dm, length)
-    minus_dm_rma = _rma(minus_dm, length)
-
-    safe_atr = atr.replace(0, np.nan)
-    plus_di = 100.0 * (plus_dm_rma / safe_atr)
-    minus_di = 100.0 * (minus_dm_rma / safe_atr)
-    
+    # Índice Direccional (DX)
+    di_diff_abs = (plus_di - minus_di).abs()
     di_sum = (plus_di + minus_di).replace(0, np.nan)
-    dx = 100.0 * (plus_di - minus_di).abs() / di_sum
+    dx = 100 * (di_diff_abs / di_sum)
     
+    # Índice Direccional Promedio (ADX)
     adx = _rma(dx.fillna(0), length)
     return adx
 
@@ -137,7 +148,7 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df_copy['EMA20'] = _ema(close, 20)
     df_copy['EMA50'] = _ema(close, 50)
     df_copy['MOM63'] = close.pct_change(63)
-    df_copy['ADX14'] = _adx(df_copy, 14) # CORRECCIÓN: Se usa la copia del df
+    df_copy['ADX14'] = _adx(df_copy, 14)
     df_copy['DollarVol20'] = (close * df_copy['Volume']).rolling(20).mean()
     return df_copy
 
@@ -155,15 +166,13 @@ def analyze_ticker(ticker: str, df: pd.DataFrame) -> Dict[str, Any]:
         enriched_df = enrich_dataframe(df)
         latest = enriched_df.iloc[-1]
         
-        # Manejo de NaNs en los valores más recientes
-        dollar_vol = latest.get('DollarVol20')
-        dollar_vol = 0 if dollar_vol is None or np.isnan(dollar_vol) else dollar_vol
+        dollar_vol = latest.get('DollarVol20', 0)
+        dollar_vol = 0 if pd.isna(dollar_vol) else dollar_vol
 
         is_liquid = dollar_vol > MIN_DOLLAR_VOL20 or ticker in FUTURES_LIQ_WHITELIST
         if not is_liquid:
             return {"ticker": ticker, "reason_excluded": "illiquid"}
 
-        # Verificar que los indicadores no sean NaN
         if pd.isna(latest['EMA20']) or pd.isna(latest['EMA50']) or pd.isna(latest['MOM63']) or pd.isna(latest['ADX14']):
             return {"ticker": ticker, "reason_excluded": "indicator_nan"}
 
@@ -185,11 +194,11 @@ def analyze_ticker(ticker: str, df: pd.DataFrame) -> Dict[str, Any]:
             "is_strict": is_strict,
             "adx": latest['ADX14'],
             "last_close": latest['Close'],
-            "atr14": latest.get('ATR14', _atr(df).iloc[-1])
+            "atr14": _atr(df).iloc[-1]
         }
     except Exception as e:
         log.error(f"Analysis failed for {ticker}: {e}", exc_info=False)
-        return {"ticker": ticker, "reason_excluded": f"analysis_error"}
+        return {"ticker": ticker, "reason_excluded": "analysis_error"}
 
 # ==============================================================================
 # 5. PIPELINE PRINCIPAL
