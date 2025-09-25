@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ranking.py - Módulo de Escaneo y Ranking de Mercado v2.0.0
+ranking.py - Módulo de Escaneo y Ranking de Mercado v2.1.0
 ---------------------------------------------------------------------
 Este módulo es responsable de analizar un universo de activos financieros,
 calcular indicadores técnicos clave y rankearlos para identificar las
@@ -57,14 +57,12 @@ def get_universe() -> List[str]:
     growth_mid = ["NOW","PANW","SNOW","NET","ZS","DDOG","SHOP","SQ","PYPL","UBER","LYFT","WBD"]
     futures = ["GC=F", "CL=F"]
     
-    # Unir y eliminar duplicados manteniendo el orden
     seen = set()
     return [t for t in etfs_core + megacaps + growth_mid + futures if not (t in seen or seen.add(t))]
 
 def download_with_retries(ticker: str, retries: int = 3, **kwargs) -> Optional[pd.DataFrame]:
     """
-    Descarga datos de yfinance con reintentos y backoff exponencial para
-    manejar errores de red temporales.
+    Descarga datos de yfinance con reintentos y backoff exponencial.
     """
     for i in range(retries):
         try:
@@ -72,9 +70,9 @@ def download_with_retries(ticker: str, retries: int = 3, **kwargs) -> Optional[p
             if not df.empty:
                 return df
             log.warning("No data found for ticker '%s'. It might be delisted.", ticker)
-            return None # Ticker válido pero sin datos, no reintentar.
+            return None
         except Exception as e:
-            wait_time = 5 * (2**i)  # Backoff: 5s, 10s, 20s
+            wait_time = 5 * (2**i)
             log.warning(
                 "Download failed for '%s' (attempt %d/%d): %s. Retrying in %ds...",
                 ticker, i + 1, retries, str(e).strip(), wait_time
@@ -100,8 +98,7 @@ def _atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
 
 def _adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
     """
-    Implementación robusta del indicador ADX usando métodos idiomáticos de Pandas
-    para evitar errores de ambigüedad y dimensionalidad.
+    Implementación robusta del indicador ADX que garantiza una salida de una sola columna.
     """
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
@@ -135,13 +132,14 @@ def _adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
 
 def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Añade todos los indicadores necesarios al DataFrame."""
-    close = df["Close"]
-    df['EMA20'] = _ema(close, 20)
-    df['EMA50'] = _ema(close, 50)
-    df['MOM63'] = close.pct_change(63)
-    df['ADX14'] = _adx(df, 14)
-    df['DollarVol20'] = (close * df['Volume']).rolling(20).mean()
-    return df
+    df_copy = df.copy()
+    close = df_copy["Close"]
+    df_copy['EMA20'] = _ema(close, 20)
+    df_copy['EMA50'] = _ema(close, 50)
+    df_copy['MOM63'] = close.pct_change(63)
+    df_copy['ADX14'] = _adx(df_copy, 14) # CORRECCIÓN: Se usa la copia del df
+    df_copy['DollarVol20'] = (close * df_copy['Volume']).rolling(20).mean()
+    return df_copy
 
 # ==============================================================================
 # 4. LÓGICA DE ANÁLISIS Y RANKING
@@ -149,7 +147,6 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 def analyze_ticker(ticker: str, df: pd.DataFrame) -> Dict[str, Any]:
     """
     Analiza un único ticker y devuelve un diccionario con sus métricas.
-    Incluye un motivo de exclusión si no califica como candidato.
     """
     try:
         if len(df) < 100:
@@ -157,10 +154,18 @@ def analyze_ticker(ticker: str, df: pd.DataFrame) -> Dict[str, Any]:
 
         enriched_df = enrich_dataframe(df)
         latest = enriched_df.iloc[-1]
+        
+        # Manejo de NaNs en los valores más recientes
+        dollar_vol = latest.get('DollarVol20')
+        dollar_vol = 0 if dollar_vol is None or np.isnan(dollar_vol) else dollar_vol
 
-        is_liquid = latest.get('DollarVol20', 0) > MIN_DOLLAR_VOL20 or ticker in FUTURES_LIQ_WHITELIST
+        is_liquid = dollar_vol > MIN_DOLLAR_VOL20 or ticker in FUTURES_LIQ_WHITELIST
         if not is_liquid:
             return {"ticker": ticker, "reason_excluded": "illiquid"}
+
+        # Verificar que los indicadores no sean NaN
+        if pd.isna(latest['EMA20']) or pd.isna(latest['EMA50']) or pd.isna(latest['MOM63']) or pd.isna(latest['ADX14']):
+            return {"ticker": ticker, "reason_excluded": "indicator_nan"}
 
         long_trend = latest['EMA20'] > latest['EMA50'] and latest['MOM63'] > 0
         short_trend = latest['EMA20'] < latest['EMA50'] and latest['MOM63'] < 0
@@ -192,7 +197,6 @@ def analyze_ticker(ticker: str, df: pd.DataFrame) -> Dict[str, Any]:
 def run_full_pipeline(**kwargs) -> Dict[str, Any]:
     """
     Orquesta todo el proceso: obtener universo, descargar datos, analizar y rankear.
-    Devuelve un diccionario estandarizado con los resultados.
     """
     t_start = time.time()
     universe = get_universe()
@@ -212,12 +216,11 @@ def run_full_pipeline(**kwargs) -> Dict[str, Any]:
         if analysis_result:
             all_results.append(analysis_result)
 
-    # --- Clasificación y Ranking ---
     candidates = [r for r in all_results if "score" in r]
     excluded_count = len(all_results) - len(candidates)
     
-    strict_candidates = sorted([c for c in candidates if c['is_strict']], key=lambda x: x.get('score', 0), reverse=True)
-    relaxed_candidates = sorted([c for c in candidates if not c['is_strict']], key=lambda x: x.get('score', 0), reverse=True)
+    strict_candidates = sorted([c for c in candidates if c.get('is_strict')], key=lambda x: x.get('score', 0), reverse=True)
+    relaxed_candidates = sorted([c for c in candidates if not c.get('is_strict')], key=lambda x: x.get('score', 0), reverse=True)
 
     top3_factors = strict_candidates[:3]
     
