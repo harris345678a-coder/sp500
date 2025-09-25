@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 App Evolutivo - Versión Profesional y Robusta
@@ -46,7 +47,7 @@ logging.basicConfig(
 log = logging.getLogger("app_evolutivo_pro")
 
 # --- Configuración de la App ---
-API_TOKEN = os.getenv("API_TOKEN", "123")
+API_TOKEN = os.getenv("RUN_TOKEN", "123") # CORREGIDO: Usando RUN_TOKEN como en tu imagen
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 REDIS_URL = os.getenv("REDIS_URL") # Render inyecta esta variable si añades el Add-on
@@ -227,36 +228,31 @@ def _normalize_signal(item: Any) -> Dict[str, Any]:
     log.warning("Item in signal list has unexpected type: %s", type(item))
     return {"symbol": str(item)}
 
-def _use_presend_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _use_presend_rules(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Ejecuta el módulo 'presend_rules' de forma segura con datos normalizados.
+    Ejecuta el módulo 'presend_rules' de forma segura y devuelve un resultado estructurado.
     """
+    approved_signals, rejected_signals = [], []
     try:
         import presend_rules # Asume que este módulo existe en tu proyecto
+        
+        top3_factors = (payload or {}).get("top3_factors", [])
+        
+        # La función build_top3_signals ahora devuelve dos listas
+        approved, rejected = presend_rules.build_top3_signals(top3_factors)
+        
+        approved_signals = [_normalize_signal(s) for s in approved]
+        rejected_signals = rejected
+
     except ImportError:
         log.error("'presend_rules.py' not found. Cannot apply pre-send rules.")
-        return []
-
-    try:
-        # Prepara una copia limpia del payload para las reglas
-        shaped_payload = {
-            k: [_normalize_signal(item) for item in v]
-            for k, v in payload.items()
-            if isinstance(v, list)
-        }
-        
-        approved_signals = presend_rules.build_top3_signals(shaped_payload)
-
-        if not isinstance(approved_signals, list):
-            log.error("presend_rules.build_top3_signals returned unexpected type: %s", type(approved_signals))
-            return []
-        
-        # Asegura que la salida final también esté normalizada
-        return [_normalize_signal(s) for s in approved_signals]
-
     except Exception as e:
         log.error("An error occurred in presend_rules.build_top3_signals: %s", e, exc_info=True)
-        return []
+    
+    return {
+        "approved": approved_signals,
+        "rejected": rejected_signals
+    }
 
 # ==============================================================================
 # 6. NOTIFICACIONES A TELEGRAM
@@ -341,7 +337,8 @@ def run_and_notify_pipeline() -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Ranking pipeline failed: {e}") from e
 
     # --- 2. Aplicar reglas de pre-envío para obtener señales finales ---
-    final_signals = _use_presend_rules(raw_payload)
+    presend_results = _use_presend_rules(raw_payload)
+    final_signals = presend_results["approved"]
     used_presend_rules = True
     
     # --- 3. Fallback: si no hay señales, analiza el TOP 3 del ranking ---
@@ -363,14 +360,31 @@ def run_and_notify_pipeline() -> Dict[str, Any]:
     t_elapsed = round(time.time() - t_start, 2)
     log.info("Pipeline finished in %s seconds.", t_elapsed)
     
+    ranking_diag = raw_payload.get("diag", {})
+    
     return {
         "ok": True,
         "elapsed_seconds": t_elapsed,
         "as_of": raw_payload.get("as_of", datetime.utcnow().isoformat()),
         "final_signals": final_signals,
         "diag": {
-            "used_presend_rules": used_presend_rules,
-            "ranking_diag": raw_payload.get("diag", {}),
+            "pipeline_flow": {
+                "used_presend_rules": used_presend_rules,
+                "used_fallback_analysis": not used_presend_rules,
+            },
+            "ranking_summary": {
+                "universe_count": ranking_diag.get("universe_count"),
+                "fetched_count": ranking_diag.get("fetched_count"),
+                "strict_candidates": ranking_diag.get("strict_candidates_count"),
+                "relaxed_candidates": ranking_diag.get("relaxed_candidates_count"),
+                "top50_found": len(raw_payload.get("top50", [])),
+                "top3_factors_found": len(raw_payload.get("top3_factors", [])),
+            },
+            "presend_rules_summary": {
+                "approved_count": len(presend_results["approved"]),
+                "rejected_count": len(presend_results["rejected"]),
+                "rejection_samples": presend_results["rejected"][:3], # Muestra de rechazos
+            },
             "telegram_notification": tg_result,
         }
     }
@@ -399,5 +413,4 @@ def run_top3_endpoint(token: Optional[str] = Header(default=None)):
         # Captura cualquier otro error inesperado durante la ejecución
         log.critical("An unhandled exception occurred during pipeline execution: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
-
 
