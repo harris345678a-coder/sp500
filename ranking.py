@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ranking.py - Módulo de Escaneo y Ranking de Mercado v2.2.0
+ranking.py - Módulo de Escaneo y Ranking de Mercado v2.3.0
 ---------------------------------------------------------------------
 Este módulo es responsable de analizar un universo de activos financieros,
 calcular indicadores técnicos clave y rankearlos para identificar las
@@ -41,6 +41,17 @@ FUTURES_LIQ_WHITELIST = {"GC=F", "CL=F"}
 # ==============================================================================
 # 2. LÓGICA DE DATOS (UNIVERSO Y DESCARGA)
 # ==============================================================================
+def _series1d(col: pd.Series or pd.DataFrame) -> pd.Series:
+    """
+    Asegura que la columna sea una Series 1-D (aplana DataFrames de 1 columna)
+    y la convierte a un tipo numérico flotante.
+    """
+    if isinstance(col, pd.DataFrame):
+        if col.shape[1] != 1:
+            raise ValueError(f"Se esperaba 1 columna para aplanar, pero llegaron {col.shape[1]}")
+        col = col.iloc[:, 0]
+    return pd.to_numeric(col, errors="coerce")
+
 def get_universe() -> List[str]:
     """
     Define y devuelve el universo de tickers a analizar.
@@ -68,6 +79,9 @@ def download_with_retries(ticker: str, retries: int = 3, **kwargs) -> Optional[p
         try:
             df = yf.download(ticker, progress=False, **kwargs)
             if not df.empty:
+                # yfinance a veces devuelve MultiIndex aun para 1 solo ticker, lo aplanamos.
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
                 return df
             log.warning("No data found for ticker '%s'. It might be delisted.", ticker)
             return None
@@ -92,9 +106,9 @@ def _rma(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(alpha=1.0 / float(length), adjust=False).mean()
 
 def _atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
-    close = df["Close"].astype(float)
+    high = _series1d(df["High"])
+    low = _series1d(df["Low"])
+    close = _series1d(df["Close"])
     tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
     return _rma(tr, length)
 
@@ -103,53 +117,43 @@ def _adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
     Implementación de ADX de grado industrial, robusta y a prueba de fallos.
     Garantiza una salida de una sola columna (pd.Series).
     """
-    high = df['High']
-    low = df['Low']
-    close = df['Close']
+    high  = _series1d(df['High'])
+    low   = _series1d(df['Low'])
+    close = _series1d(df['Close'])
     
-    # Movimiento Direccional
     move_up = high.diff()
     move_down = low.diff().mul(-1)
     
-    plus_dm = pd.Series(
-        np.where((move_up > move_down) & (move_up > 0), move_up, 0.0),
-        index=df.index
-    )
-    minus_dm = pd.Series(
-        np.where((move_down > move_up) & (move_down > 0), move_down, 0.0),
-        index=df.index
-    )
+    plus_dm  = pd.Series(np.where((move_up  > move_down) & (move_up  > 0), move_up,  0.0), index=df.index)
+    minus_dm = pd.Series(np.where((move_down > move_up)   & (move_down > 0), move_down, 0.0), index=df.index)
 
-    # True Range
     tr = pd.concat([
         high - low,
         (high - close.shift(1)).abs(),
         (low - close.shift(1)).abs()
     ], axis=1).max(axis=1)
     
-    # Suavizado Wilder (RMA)
     atr = _rma(tr, length)
     plus_di = 100 * (_rma(plus_dm, length) / atr.replace(0, np.nan))
     minus_di = 100 * (_rma(minus_dm, length) / atr.replace(0, np.nan))
     
-    # Índice Direccional (DX)
     di_diff_abs = (plus_di - minus_di).abs()
     di_sum = (plus_di + minus_di).replace(0, np.nan)
     dx = 100 * (di_diff_abs / di_sum)
     
-    # Índice Direccional Promedio (ADX)
     adx = _rma(dx.fillna(0), length)
     return adx
 
 def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Añade todos los indicadores necesarios al DataFrame."""
     df_copy = df.copy()
-    close = df_copy["Close"]
+    close = _series1d(df_copy["Close"])
+    vol   = _series1d(df_copy["Volume"])
     df_copy['EMA20'] = _ema(close, 20)
     df_copy['EMA50'] = _ema(close, 50)
     df_copy['MOM63'] = close.pct_change(63)
     df_copy['ADX14'] = _adx(df_copy, 14)
-    df_copy['DollarVol20'] = (close * df_copy['Volume']).rolling(20).mean()
+    df_copy['DollarVol20'] = (close * vol).rolling(20).mean()
     return df_copy
 
 # ==============================================================================
@@ -193,8 +197,8 @@ def analyze_ticker(ticker: str, df: pd.DataFrame) -> Dict[str, Any]:
             "score": score if pd.notna(score) else 0.0,
             "is_strict": is_strict,
             "adx": latest['ADX14'],
-            "last_close": latest['Close'],
-            "atr14": _atr(df).iloc[-1]
+            "last_close": float(_series1d(df['Close']).iloc[-1]),
+            "atr14": float(_atr(df).iloc[-1])
         }
     except Exception as e:
         log.error(f"Analysis failed for {ticker}: {e}", exc_info=False)
