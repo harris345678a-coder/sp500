@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-app_evolutivo.py - Orquestador con Validación Profesional v4.4.2 (con mejoras de robustez)
+app_evolutivo.py - Orquestador con Validación Profesional v4.4.2 (con mejoras de robustez v2)
 ---------------------------------------------------------------------
 Este módulo implementa una lógica de validación de señales de nivel
 profesional sobre los 50 MEJORES candidatos del ranking.
@@ -62,7 +62,7 @@ def _get_symbol_60m(df_bulk_60m, symbol, log=None):
     if df_60m is None:
         try:
             import yfinance as yf
-            # --- NUEVO: cache simple por símbolo ---
+            # --- cache simple por símbolo ---
             if symbol in _FALLBACK_CACHE_60M:
                 df_single = _FALLBACK_CACHE_60M[symbol]
             else:
@@ -114,14 +114,15 @@ def _normalize_bulk_ticker_price(df_bulk, symbols_set, log=None):
         return df_bulk
 
     cols = getattr(df_bulk, "columns", None)
-    # --- NUEVO: coerción a MultiIndex si es un solo símbolo y columnas OHLCV ---
+
+    # Caso: SIN MultiIndex
     if not isinstance(cols, _pd.MultiIndex):
+        # Si sólo hay un símbolo y las columnas son OHLCV, forzamos MultiIndex
         precios = {"Open","High","Low","Close","Adj Close","Volume"}
         try:
             colset = set(map(str, cols)) if cols is not None else set()
         except Exception:
             colset = set()
-
         if len(symbols_set) == 1 and colset and colset.issubset(precios):
             sym = next(iter(symbols_set))
             df_bulk.columns = _pd.MultiIndex.from_product([[sym], list(df_bulk.columns)])
@@ -135,13 +136,13 @@ def _normalize_bulk_ticker_price(df_bulk, symbols_set, log=None):
             except Exception: pass
         return df_bulk
 
-    # Ya es MultiIndex: asegurar orden (Ticker, Precio)
+    # Caso: CON MultiIndex, asegurar orden (Ticker, Precio)
     level0 = set(map(str, cols.get_level_values(0)))
     level1 = set(map(str, cols.get_level_values(1)))
     precios = {"Open","High","Low","Close","Adj Close","Volume"}
     if (level0 & precios) and (level1 & symbols_set):
         try:
-            df_bulk = df_bulk.swaplevel(0, 1, axis=1).sort_index(axis=1)
+            df_bulk = df_bulk.swaplevel(0,1, axis=1).sort_index(axis=1)
             if log:
                 try: log.info("Normalizado bulk a (Ticker, Precio) mediante swaplevel.")
                 except Exception: pass
@@ -216,34 +217,34 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
 
     log.info(f"Starting professional validation for up to {len(candidates)} candidates...")
     
+    # --- DESCARGA MASIVA 60m ROBUSTA ---
     symbols_to_validate = [c["ticker"] for c in candidates if "ticker" in c]
     if not symbols_to_validate:
         return validated_signals
 
-    # --- DESCARGA MASIVA 60m CON MULTIINDEX GARANTIZADO ---
-    symbols_list = list(set(symbols_to_validate))
+    tickers_str = " ".join(set(symbols_to_validate))
     df_bulk_60m = None
-    try: # Intento preferido: wrapper de ranking con "tickers" como lista
+    
+    # INTENTO 1: wrapper con 'ticker' posicional y group_by="ticker"
+    try:
+        # Asumimos firma: download_with_retries(ticker, period, interval, **kwargs)
         df_bulk_60m = ranking.download_with_retries(
-            tickers=symbols_list,
-            period="60d",
-            interval="60m",
-            group_by="ticker"
+            tickers_str, "60d", "60m", group_by="ticker"
         )
     except TypeError:
-        # Compatibilidad con wrappers antiguos: cadena separada por espacios
-        df_bulk_60m = ranking.download_with_retries(
-            tickers=" ".join(symbols_list),
-            period="60d",
-            interval="60m",
-            group_by="ticker"
-        )
+        # INTENTO 2: wrapper sin group_by (por si no lo acepta)
+        try:
+            df_bulk_60m = ranking.download_with_retries(
+                tickers_str, "60d", "60m"
+            )
+        except Exception:
+            df_bulk_60m = None
     
-    # Fallback robusto: yfinance directo si el wrapper no devuelve MultiIndex
-    if not isinstance(getattr(df_bulk_60m, "columns", None), pd.MultiIndex):
+    # INTENTO 3: fallback a yfinance (garantiza MultiIndex si hay >1 ticker)
+    if df_bulk_60m is None:
         import yfinance as yf
         df_bulk_60m = yf.download(
-            tickers=" ".join(symbols_list),
+            tickers=tickers_str,
             period="60d",
             interval="60m",
             group_by="ticker",
@@ -251,13 +252,12 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
             progress=False,
         )
 
-    # Normalizar a (Ticker, Precio)
-    df_bulk_60m = _normalize_bulk_ticker_price(df_bulk_60m, set(symbols_list), log)
+    # Normalizar layout a (Ticker, Precio) una sola vez
+    df_bulk_60m = _normalize_bulk_ticker_price(df_bulk_60m, set(symbols_to_validate), log)
     
     if df_bulk_60m is None or df_bulk_60m.empty:
         log.error("Failed to download bulk 60m data for validation. Aborting phase.")
         return validated_signals
-
 
     for i, cand in enumerate(candidates):
         symbol = cand.get("ticker")
