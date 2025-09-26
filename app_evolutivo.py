@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-app_evolutivo.py - Orquestador con Validación Profesional v4.4.1
+app_evolutivo.py - Orquestador con Validación Profesional v4.4.2
 ---------------------------------------------------------------------
 Este módulo implementa una lógica de validación de señales de nivel
 profesional sobre los 50 MEJORES candidatos del ranking.
@@ -99,7 +99,7 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
 
     # --- OPTIMIZACIÓN CLAVE: Descarga masiva de datos ---
     df_bulk_60m = ranking.download_with_retries(
-        tickers=" ".join(symbols_to_validate),
+        ticker=" ".join(symbols_to_validate), # CORRECCIÓN: Usar 'ticker' en lugar de 'tickers'
         period="60d",
         interval="60m"
     )
