@@ -77,7 +77,17 @@ def download_with_retries(ticker: str, retries: int = 3, **kwargs) -> Optional[p
             if not df.empty:
                 # yfinance a veces devuelve MultiIndex aun para 1 solo ticker, lo aplanamos.
                 if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
+                cols = df.columns
+                # Elegir el nivel que contenga los campos de precio (p. ej., 'Close')
+                if 'Close' in cols.get_level_values(0):
+                    df.columns = cols.get_level_values(0)
+                elif 'Close' in cols.get_level_values(1):
+                    df.columns = cols.get_level_values(1)
+                else:
+                    _price = {'Open','High','Low','Close','Adj Close','Volume'}
+                    lvl0 = set(map(str, cols.get_level_values(0)))
+                    lvl1 = set(map(str, cols.get_level_values(1)))
+                    df.columns = cols.get_level_values(1) if len(_price & lvl1) > len(_price & lvl0) else cols.get_level_values(0)
                 return df
             log.warning("No data found for ticker '%s'. It might be delisted.", ticker)
             return None
