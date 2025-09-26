@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-app_evolutivo.py - Orquestador con Validación Profesional v4.4.0
+app_evolutivo.py - Orquestador con Validación Profesional v4.4.1
 ---------------------------------------------------------------------
 Este módulo implementa una lógica de validación de señales de nivel
 profesional sobre los 50 MEJORES candidatos del ranking.
@@ -99,7 +99,7 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
 
     # --- OPTIMIZACIÓN CLAVE: Descarga masiva de datos ---
     df_bulk_60m = ranking.download_with_retries(
-        ticker=" ".join(symbols_to_validate),
+        tickers=" ".join(symbols_to_validate),
         period="60d",
         interval="60m"
     )
@@ -117,9 +117,9 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
         log.info(f"({i+1}/{len(candidates)}) Validating {symbol} ({side})...")
         try:
             # Seleccionar los datos del ticker actual desde el DataFrame masivo
-            df_60m = df_bulk_60m.loc[:, (slice(None), symbol)]
+            df_60m = df_bulk_60m.loc[:, pd.IndexSlice[:, symbol]].copy()
             df_60m.columns = df_60m.columns.droplevel(1) # Aplanar MultiIndex
-            df_60m = df_60m.dropna() # Eliminar filas con NaNs que impiden el cálculo
+            df_60m = df_60m.dropna()
 
             if len(df_60m) < 22:
                 log.warning(f"[{symbol}] Insufficient 60m data after cleaning. Skipping.")
@@ -175,7 +175,7 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
 # ==============================================================================
 # 4. ORQUESTADOR Y API
 # ==============================================================================
-app = FastAPI(title="App Evolutivo - Sistema Profesional", version="4.4.0")
+app = FastAPI(title="App Evolutivo - Sistema Profesional", version="4.4.1")
 
 def send_new_signal_notification(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Notifica sobre la creación de NUEVAS señales de alta calidad."""
@@ -237,7 +237,7 @@ def run_discovery_pipeline() -> Dict:
 def healthz():
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
-@app.get("/rank/run", summary="Run Full Discovery and Validation on Top 50")
+@app.get("/rank/run-top3", summary="Run Full Discovery and Validation on Top 50") # <-- URL RESTAURADA
 def run_full_pipeline_endpoint(token: Optional[str] = Query(default=None)):
     """
     Ejecuta el pipeline completo para descubrir nuevas señales.
