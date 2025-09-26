@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-app_evolutivo.py - Orquestador de Pipeline Profesional v3.0.0
+app_evolutivo.py - Orquestador con Validación Profesional v4.3.0
 ---------------------------------------------------------------------
-Este módulo actúa como el orquestador principal del sistema. Es responsable de:
-1. Exponer la API web.
-2. Llamar al motor de ranking (`ranking.py`) para obtener candidatos.
-3. Realizar una validación de calidad dinámica sobre los mejores candidatos.
-4. Notificar a Telegram SOLO si existen señales de alta probabilidad.
+Este módulo implementa una lógica de validación de señales de nivel
+profesional sobre los 50 MEJORES candidatos del ranking.
 
-Diseño Robusto y Profesional:
-- Flujo de doble filtro: Escaneo amplio (ranking) + Validación estricta (aquí).
-- Cero notificaciones de baja calidad: Se eliminó la lógica de fallback.
-- Lógica tolerante a fallos para garantizar la finalización del pipeline.
+NUEVA LÓGICA DE TRABAJO:
+1.  Obtiene los 50 mejores candidatos del motor de `ranking.py`.
+2.  Itera sobre estos 50 y somete a cada uno al "Checklist de Despegue".
+3.  De todos los que PASAN la validación, los ordena por el mejor
+    ratio riesgo/beneficio y selecciona los 3 MEJORES.
+4.  Estos "Tres Finales" son los que se guardan y notifican.
 """
 import os
 import time
@@ -31,11 +30,10 @@ from fastapi.responses import JSONResponse
 try:
     import ranking
 except ImportError:
-    log.error("Error: ranking.py no se encuentra. Asegúrate de que esté en el mismo directorio.")
     # Permite que la app inicie, pero fallará en la ejecución.
     ranking = None
 
-# --- Cliente de Redis (Opcional, para deduplicación) ---
+# --- Cliente de Redis ---
 try:
     import redis
     _REDIS_AVAILABLE = True
@@ -49,216 +47,204 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)-8s | %(name)s:%(lineno)d - %(message)s",
 )
-log = logging.getLogger("app_evolutivo")
+log = logging.getLogger("app_evolutivo_pro")
 
-# --- Variables de Entorno ---
 API_TOKEN = os.getenv("RUN_TOKEN", "123")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 REDIS_URL = os.getenv("REDIS_URL")
+ACTIVE_SIGNALS_KEY = "evolutivo:active_signals"
 
 # ==============================================================================
-# 2. LÓGICA DE ESTADO (DEDUPLICACIÓN DE NOTIFICACIONES)
+# 2. LÓGICA DE ESTADO (Redis)
 # ==============================================================================
 _redis_client = None
-
 def get_redis_client() -> Optional['redis.Redis']:
     """Inicializa y devuelve un cliente de Redis si está configurado."""
     global _redis_client
     if not _REDIS_AVAILABLE or not REDIS_URL: return None
     if _redis_client is None:
         try:
-            log.info("Connecting to Redis for deduplication...")
             _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
             _redis_client.ping()
         except Exception as e:
-            log.error("Failed to connect to Redis: %s", e)
+            log.error(f"Failed to connect to Redis: {e}")
             _redis_client = None
     return _redis_client
 
-def read_last_digest() -> Optional[str]:
-    """Lee el último digest de notificación desde Redis."""
+def update_signal_in_db(signal: Dict):
+    """Guarda o actualiza una señal en la base de datos de Redis."""
     r = get_redis_client()
-    if r:
-        try: return r.get("evolutivo:last_digest")
-        except Exception as e: log.error("Error reading from Redis: %s", e)
-    return None
-
-def write_last_digest(digest: str):
-    """Escribe el último digest en Redis con una expiración de 7 días."""
-    r = get_redis_client()
-    if r:
-        try: r.set("evolutivo:last_digest", digest, ex=60*60*24*7)
-        except Exception as e: log.error("Error writing to Redis: %s", e)
+    if not r: return
+    signal_id = f"{signal['symbol']}:{signal['side']}"
+    try:
+        r.hset(ACTIVE_SIGNALS_KEY, signal_id, json.dumps(signal))
+    except Exception as e:
+        log.error(f"Failed to update signal {signal_id} in Redis: {e}")
 
 # ==============================================================================
-# 3. VALIDACIÓN DE SEÑALES DE ALTA CALIDAD
+# 3. LÓGICA DE VALIDACIÓN DE SEÑALES PROFESIONAL
 # ==============================================================================
 def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
     """
-    Toma los mejores candidatos del ranking y los valida con reglas estrictas
-    usando datos intradía para generar señales de alta calidad.
+    Toma una lista de candidatos y los somete a un checklist de validación
+    de breakout de nivel profesional usando datos de 60 minutos.
     """
-    final_signals = []
+    validated_signals = []
     if not candidates:
-        return final_signals
+        return validated_signals
 
-    log.info(f"Validating {len(candidates)} top candidates with intraday data...")
-    for cand in candidates:
+    log.info(f"Starting professional validation for up to {len(candidates)} candidates...")
+    for i, cand in enumerate(candidates):
         symbol = cand.get("ticker")
-        if not symbol: continue
+        side = cand.get("side")
+        if not symbol or not side:
+            continue
         
+        log.info(f"({i+1}/{len(candidates)}) Validating {symbol} ({side})...")
         try:
-            # Descargar datos de 60 minutos para un análisis más fino
+            # 1. OBTENER DATOS INTRADÍA
             df_60m = ranking.download_with_retries(symbol, period="60d", interval="60m")
-            if df_60m is None or df_60m.empty:
-                log.warning(f"No 60m data for {symbol}, skipping validation.")
+            if df_60m is None or len(df_60m) < 22: # Minimo para EMA21 + velas de pivot
+                log.warning(f"[{symbol}] Insufficient 60m data for validation. Skipping.")
                 continue
 
-            price = df_60m['Close'].iloc[-1]
-            atr = ranking._atr(df_60m, 14).iloc[-1]
-
-            if not pd.notna(price) or not pd.notna(atr) or atr == 0:
-                log.warning(f"Invalid price or ATR for {symbol}. Skipping.")
+            # 2. CALCULAR INDICADORES INTRADÍA
+            df_60m['EMA8'] = ranking._ema(df_60m['Close'], 8)
+            df_60m['EMA21'] = ranking._ema(df_60m['Close'], 21)
+            df_60m['ATR14'] = ranking._atr(df_60m, 14)
+            df_60m['AvgVol20'] = df_60m['Volume'].rolling(20).mean()
+            
+            latest = df_60m.iloc[-1]
+            price, atr = latest['Close'], latest['ATR14']
+            
+            required_values = [price, atr, latest['EMA8'], latest['EMA21'], latest['AvgVol20']]
+            if any(pd.isna(v) for v in required_values):
+                log.warning(f"[{symbol}] Indicators have NaN values. Skipping.")
                 continue
 
-            # Lógica de riesgo/beneficio
-            side = cand.get("side", "long")
-            sl = price - 1.2 * atr if side == "long" else price + 1.2 * atr
-            tp = price + 1.9 * atr if side == "long" else price - 1.9 * atr
-            rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 1e-9 else 0
+            # 3. CHECKLIST DE VALIDACIÓN DE BREAKOUT
+            if side == 'long':
+                pivot_level = df_60m['High'].iloc[-6:-1].max()
+                price_ok = price > pivot_level
+                volume_ok = latest['Volume'] > latest['AvgVol20']
+                trend_ok = latest['EMA8'] > latest['EMA21']
+                extension_ok = (price - latest['EMA21']) < (1.5 * atr)
+            else: # side == 'short'
+                pivot_level = df_60m['Low'].iloc[-6:-1].min()
+                price_ok = price < pivot_level
+                volume_ok = latest['Volume'] > latest['AvgVol20']
+                trend_ok = latest['EMA8'] < latest['EMA21']
+                extension_ok = (latest['EMA21'] - price) < (1.5 * atr)
 
-            # --- FILTRO DE CALIDAD FINAL ---
-            # Solo se aprueba si el ratio riesgo/beneficio es aceptable.
-            if rr > 1.5:
-                final_signals.append({
-                    "symbol": symbol,
-                    "side": side,
-                    "strategy": "Evolutivo Validated",
-                    "trigger_price": round(price, 4),
-                    "stop_loss": round(sl, 4),
-                    "take_profit": round(tp, 4),
+            log.info(f"[{symbol}] Checklist | Price OK: {price_ok}, Volume OK: {volume_ok}, Trend OK: {trend_ok}, Extension OK: {extension_ok}")
+
+            # 4. APROBAR SEÑAL SI TODO ES CORRECTO
+            if price_ok and volume_ok and trend_ok and extension_ok:
+                sl = price - 1.2 * atr if side == "long" else price + 1.2 * atr
+                tp1 = price + 1.0 * atr if side == "long" else price - 1.0 * atr
+                tp2 = price + 1.9 * atr if side == "long" else price - 1.9 * atr
+                rr = abs(tp2 - price) / abs(price - sl) if abs(price - sl) > 1e-9 else 0
+
+                validated_signals.append({
+                    "symbol": symbol, "side": side, "strategy": "Breakout Validated",
+                    "trigger_price": round(price, 4), "stop_loss": round(sl, 4),
+                    "take_profit_1": round(tp1, 4), "take_profit_2": round(tp2, 4),
                     "risk_reward_ratio": round(rr, 2)
                 })
-            else:
-                log.info(f"Candidate {symbol} rejected due to low RR: {rr:.2f}")
-
+                log.info(f"[{symbol}] PASSED validation. Added to potential signals.")
         except Exception as e:
-            log.error(f"Validation failed for {symbol}: {e}", exc_info=False)
-
-    return final_signals
+            log.error(f"[{symbol}] An unexpected error occurred during validation: {e}", exc_info=False)
+            
+    return validated_signals
 
 # ==============================================================================
-# 4. LÓGICA DE NOTIFICACIÓN A TELEGRAM
+# 4. ORQUESTADOR Y API
 # ==============================================================================
-def _escape_html(text: str) -> str:
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+app = FastAPI(title="App Evolutivo - Sistema Profesional", version="4.3.0")
 
-def _format_signal_msg(signal: Dict[str, Any]) -> str:
-    """Formatea una única señal en un mensaje HTML para Telegram."""
-    sym = _escape_html(signal.get("symbol", "?"))
-    side = _escape_html(signal.get("side", "")).upper()
-    strat = _escape_html(signal.get("strategy", "Validated"))
-    
-    header = f"<b>{sym} • {side} • {strat}</b>"
-    
-    levels = [
-        f"TG: {signal.get('trigger_price', 'N/A')}",
-        f"SL: {signal.get('stop_loss', 'N/A')}",
-        f"TP: {signal.get('take_profit', 'N/A')}",
-        f"RR: {signal.get('risk_reward_ratio', 'N/A')}"
-    ]
-    return f"{header}\n{' | '.join(levels)}"
-
-def send_telegram_notification(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Construye y envía la notificación a Telegram."""
-    if not BOT_TOKEN or not CHAT_ID:
-        return {"sent": False, "reason": "telegram_not_configured"}
-        
+def send_new_signal_notification(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Notifica sobre la creación de NUEVAS señales de alta calidad."""
+    if not BOT_TOKEN or not CHAT_ID: return {"sent": False, "reason": "telegram_not_configured"}
     if not signals:
         log.info("No high-quality signals found after validation. No notification will be sent.")
         return {"sent": False, "reason": "no_signals_approved"}
 
-    messages = [_format_signal_msg(s) for s in signals]
+    messages = [f"<b>🚨 NUEVA SEÑAL: {s['symbol']} ({s['side'].upper()})</b>\nEntrada: {s['trigger_price']} | SL: {s['stop_loss']} | TP1: {s['take_profit_1']}" for s in signals]
     full_message_text = "\n\n".join(messages)
     
-    # Deduplicación para evitar spam si se ejecuta varias veces
-    new_digest = hashlib.sha256(full_message_text.encode("utf-8")).hexdigest()
-    if read_last_digest() == new_digest:
-        log.info("Skipping Telegram notification: duplicate content.")
-        return {"sent": False, "reason": "duplicate_content"}
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": full_message_text, "parse_mode": "HTML"}
     
     try:
-        resp = requests.post(url, json=payload, timeout=15)
-        resp.raise_for_status()
-        log.info(f"Successfully sent {len(signals)} signal(s) to Telegram.")
-        write_last_digest(new_digest)
+        requests.post(url, json=payload, timeout=10).raise_for_status()
+        log.info(f"Successfully sent {len(signals)} NEW signal(s) to Telegram.")
         return {"sent": True, "count": len(signals)}
-    except requests.RequestException as e:
-        log.error("Failed to send notification to Telegram: %s", e)
-        return {"sent": False, "reason": f"http_error"}
+    except Exception as e:
+        log.error("Failed to send new signal notification: %s", e)
+        return {"sent": False, "reason": "http_error"}
 
-# ==============================================================================
-# 5. ORQUESTADOR PRINCIPAL Y API (FastAPI)
-# ==============================================================================
-app = FastAPI(title="App Evolutivo - Orquestador", version="3.0.0")
-
-def run_complete_pipeline() -> Dict[str, Any]:
-    """Función principal que orquesta la ejecución del pipeline completo."""
-    t_start = time.time()
-    
-    # 1. Ejecutar el motor de escaneo y ranking
+def run_discovery_pipeline() -> Dict:
+    """
+    Ejecuta el pipeline de descubrimiento, validando el Top 50 y seleccionando los 3 mejores.
+    """
+    log.info("--- Starting Discovery Phase ---")
     if not ranking:
         raise HTTPException(status_code=500, detail="Ranking module not loaded.")
+    
     ranking_payload = ranking.run_full_pipeline()
     if not ranking_payload.get("ok"):
-        raise HTTPException(status_code=500, detail=f"Ranking pipeline failed: {ranking_payload.get('error')}")
+        raise HTTPException(status_code=500, detail="Ranking pipeline failed")
     
-    top3_candidates = ranking_payload.get("top3_factors", [])
-
-    # 2. Validar los mejores candidatos para generar señales de alta calidad
-    final_signals = validate_and_build_signals(top3_candidates)
+    # 1. Obtener los 50 mejores candidatos del motor de ranking
+    top50_candidates = ranking_payload.get("top50_candidates", [])
     
-    # 3. Enviar notificación SOLO si hay señales validadas
-    tg_result = send_telegram_notification(final_signals)
-
-    t_elapsed = round(time.time() - t_start, 2)
-    log.info(f"Complete pipeline finished in {t_elapsed} seconds.")
+    # 2. Validar la lista completa de candidatos
+    validated_signals = validate_and_build_signals(top50_candidates)
+    
+    # 3. Seleccionar los 3 mejores de los validados, ordenados por RR
+    final_top_3 = sorted(validated_signals, key=lambda x: x['risk_reward_ratio'], reverse=True)[:3]
+    
+    if final_top_3:
+        for signal in final_top_3:
+            signal['status'] = 'active'
+            signal['created_at'] = datetime.now(timezone.utc).isoformat()
+            update_signal_in_db(signal)
+            
+    tg_result = send_new_signal_notification(final_top_3)
     
     return {
-        "ok": True,
-        "elapsed_seconds": t_elapsed,
-        "as_of": ranking_payload.get("as_of"),
-        "final_signals": final_signals,
-        "diag": {
-            "ranking_summary": ranking_payload.get("diag", {}),
-            "validation_summary": {
-                "candidates_evaluated": len(top3_candidates),
-                "signals_approved": len(final_signals),
-            },
-            "telegram_notification": tg_result,
-        }
+        "ranking_diag": ranking_payload.get("diag", {}),
+        "candidates_evaluated": len(top50_candidates),
+        "signals_validated": len(validated_signals),
+        "final_signals_selected": len(final_top_3),
+        "telegram_notification": tg_result,
+        "final_signals": final_top_3
     }
 
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
-@app.get("/rank/run-top3", summary="Run Full Pipeline and Notify")
-def run_top3_endpoint(token: Optional[str] = Query(default=None)):
-    """
-    Ejecuta el pipeline de ranking, valida los 3 mejores y notifica
-    únicamente si se encuentran señales de alta calidad.
-    """
+@app.get("/rank/run", summary="Run Full Discovery and Validation on Top 50")
+def run_full_pipeline_endpoint(token: Optional[str] = Query(default=None)):
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid API token")
     
+    t_start = time.time()
     try:
-        result = run_complete_pipeline()
-        return JSONResponse(content=result)
+        # Nota: En un sistema completo, la fase de monitoreo iría aquí primero.
+        # run_monitoring_phase()
+        discovery_results = run_discovery_phase()
+        t_elapsed = round(time.time() - t_start, 2)
+        log.info(f"Full pipeline finished in {t_elapsed}s.")
+
+        return JSONResponse(content={
+            "ok": True,
+            "elapsed_seconds": t_elapsed,
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "discovery_summary": discovery_results,
+        })
     except Exception as e:
-        log.critical("An unhandled exception occurred during pipeline execution: %s", e, exc_info=True)
+        log.critical("An unhandled exception occurred during full pipeline execution: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
