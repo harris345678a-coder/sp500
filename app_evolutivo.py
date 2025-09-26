@@ -30,7 +30,6 @@ from fastapi.responses import JSONResponse
 try:
     import ranking
 except ImportError:
-    # Permite que la app inicie, pero fallará en la ejecución.
     ranking = None
 
 # --- Cliente de Redis ---
@@ -43,10 +42,7 @@ except ImportError:
 # ==============================================================================
 # 1. CONFIGURACIÓN Y LOGGING
 # ==============================================================================
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)-8s | %(name)s:%(lineno)d - %(message)s",
-)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s | %(levelname)-8s | %(name)s:%(lineno)d - %(message)s")
 log = logging.getLogger("app_evolutivo_pro")
 
 API_TOKEN = os.getenv("RUN_TOKEN", "123")
@@ -228,13 +224,17 @@ def healthz():
 
 @app.get("/rank/run", summary="Run Full Discovery and Validation on Top 50")
 def run_full_pipeline_endpoint(token: Optional[str] = Query(default=None)):
+    """
+    Ejecuta el pipeline completo para descubrir nuevas señales.
+    La autenticación se realiza vía parámetro 'token' en la URL.
+    """
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid API token")
     
     t_start = time.time()
     try:
-        # Nota: En un sistema completo, la fase de monitoreo iría aquí primero.
-        # run_monitoring_phase()
+        # En un sistema completo, la fase de monitoreo podría ir aquí.
+        # run_monitoring_phase() 
         discovery_results = run_discovery_phase()
         t_elapsed = round(time.time() - t_start, 2)
         log.info(f"Full pipeline finished in {t_elapsed}s.")
