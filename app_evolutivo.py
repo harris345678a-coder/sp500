@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-app_evolutivo.py - Orquestador con Validación Profesional v4.4.2
+app_evolutivo.py - Orquestador con Validación Profesional v4.4.2 (con mejoras de robustez)
 ---------------------------------------------------------------------
 Este módulo implementa una lógica de validación de señales de nivel
 profesional sobre los 50 MEJORES candidatos del ranking.
@@ -26,6 +26,9 @@ import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+
+# --- Cache para el fallback de descarga por símbolo ---
+_FALLBACK_CACHE_60M = {}
 
 
 # --- helper añadido para extraer un símbolo de forma robusta sin romper nada ---
@@ -55,18 +58,24 @@ def _get_symbol_60m(df_bulk_60m, symbol, log=None):
             except Exception:
                 pass
 
-    # Intento 2: si no se pudo, descargar solo el símbolo (sin tocar el resto del flujo)
+    # Intento 2: si no se pudo, descargar solo el símbolo (con cache)
     if df_60m is None:
         try:
             import yfinance as yf
-            df_single = yf.download(
-                tickers=symbol,
-                period="60d",
-                interval="60m",
-                group_by="ticker",
-                auto_adjust=False,
-                progress=False,
-            )
+            # --- NUEVO: cache simple por símbolo ---
+            if symbol in _FALLBACK_CACHE_60M:
+                df_single = _FALLBACK_CACHE_60M[symbol]
+            else:
+                df_single = yf.download(
+                    tickers=symbol,
+                    period="60d",
+                    interval="60m",
+                    group_by="ticker",
+                    auto_adjust=False,
+                    progress=False,
+                )
+                _FALLBACK_CACHE_60M[symbol] = df_single
+
             if isinstance(df_single.columns, _pd.MultiIndex):
                 try:
                     df_60m = df_single.xs(symbol, level=0, axis=1).copy()
@@ -86,7 +95,6 @@ def _get_symbol_60m(df_bulk_60m, symbol, log=None):
     requeridas = {"Open", "High", "Low", "Close", "Volume"}
     colset = {str(c) for c in df_60m.columns}
     if not requeridas.issubset(colset):
-        # A veces yfinance trae 'Adj Close'; no lo exigimos, solo las básicas
         if log:
             try:
                 log.warning(f"[{symbol}]] Faltan columnas OHLCV tras el slice: {list(df_60m.columns)}")
@@ -104,31 +112,43 @@ def _normalize_bulk_ticker_price(df_bulk, symbols_set, log=None):
     import pandas as _pd
     if df_bulk is None or getattr(df_bulk, "empty", True):
         return df_bulk
+
     cols = getattr(df_bulk, "columns", None)
+    # --- NUEVO: coerción a MultiIndex si es un solo símbolo y columnas OHLCV ---
     if not isinstance(cols, _pd.MultiIndex):
-        # No hay niveles múltiples; no podemos inferir tickers si hay más de uno
+        precios = {"Open","High","Low","Close","Adj Close","Volume"}
+        try:
+            colset = set(map(str, cols)) if cols is not None else set()
+        except Exception:
+            colset = set()
+
+        if len(symbols_set) == 1 and colset and colset.issubset(precios):
+            sym = next(iter(symbols_set))
+            df_bulk.columns = _pd.MultiIndex.from_product([[sym], list(df_bulk.columns)])
+            if log:
+                try: log.info("Coercido bulk de un solo símbolo a (Ticker, Precio).")
+                except Exception: pass
+            return df_bulk
+
         if log:
-            try:
-                log.info("Bulk sin MultiIndex; se usará extracción defensiva por símbolo.")
-            except Exception:
-                pass
+            try: log.info("Bulk sin MultiIndex; se usará extracción defensiva por símbolo.")
+            except Exception: pass
         return df_bulk
-    # Si el primer nivel parece ser precios (Open, High, ...) y el segundo tickers -> swap
+
+    # Ya es MultiIndex: asegurar orden (Ticker, Precio)
     level0 = set(map(str, cols.get_level_values(0)))
     level1 = set(map(str, cols.get_level_values(1)))
     precios = {"Open","High","Low","Close","Adj Close","Volume"}
-    # Detectar cuál nivel luce como 'precios'
-    if level0 & precios and (level1 & symbols_set):
+    if (level0 & precios) and (level1 & symbols_set):
         try:
-            df_bulk = df_bulk.swaplevel(0,1, axis=1).sort_index(axis=1)
+            df_bulk = df_bulk.swaplevel(0, 1, axis=1).sort_index(axis=1)
             if log:
-                try:
-                    log.info("Normalizado bulk a (Ticker, Precio) mediante swaplevel.")
-                except Exception:
-                    pass
+                try: log.info("Normalizado bulk a (Ticker, Precio) mediante swaplevel.")
+                except Exception: pass
         except Exception:
             pass
     return df_bulk
+
 
 # Importar el motor de ranking
 try:
@@ -200,19 +220,44 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
     if not symbols_to_validate:
         return validated_signals
 
-    # --- OPTIMIZACIÓN CLAVE: Descarga masiva de datos ---
-    df_bulk_60m = ranking.download_with_retries(
-        ticker=" ".join(symbols_to_validate), # CORRECCIÓN CRÍTICA: Usar 'ticker' en singular
-        period="60d",
-        interval="60m",
-        group_by="ticker"  # <-- GARANTIZA MultiIndex para la descarga masiva
-    )
-    # Normalizar una sola vez el layout del bulk
-    df_bulk_60m = _normalize_bulk_ticker_price(df_bulk_60m, set(symbols_to_validate), log)
+    # --- DESCARGA MASIVA 60m CON MULTIINDEX GARANTIZADO ---
+    symbols_list = list(set(symbols_to_validate))
+    df_bulk_60m = None
+    try: # Intento preferido: wrapper de ranking con "tickers" como lista
+        df_bulk_60m = ranking.download_with_retries(
+            tickers=symbols_list,
+            period="60d",
+            interval="60m",
+            group_by="ticker"
+        )
+    except TypeError:
+        # Compatibilidad con wrappers antiguos: cadena separada por espacios
+        df_bulk_60m = ranking.download_with_retries(
+            tickers=" ".join(symbols_list),
+            period="60d",
+            interval="60m",
+            group_by="ticker"
+        )
+    
+    # Fallback robusto: yfinance directo si el wrapper no devuelve MultiIndex
+    if not isinstance(getattr(df_bulk_60m, "columns", None), pd.MultiIndex):
+        import yfinance as yf
+        df_bulk_60m = yf.download(
+            tickers=" ".join(symbols_list),
+            period="60d",
+            interval="60m",
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+        )
 
+    # Normalizar a (Ticker, Precio)
+    df_bulk_60m = _normalize_bulk_ticker_price(df_bulk_60m, set(symbols_list), log)
+    
     if df_bulk_60m is None or df_bulk_60m.empty:
         log.error("Failed to download bulk 60m data for validation. Aborting phase.")
         return validated_signals
+
 
     for i, cand in enumerate(candidates):
         symbol = cand.get("ticker")
@@ -227,7 +272,7 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
             if df_60m is None:
                 log.warning(f"[{symbol}] Datos 60m no disponibles tras normalización; se omite.")
                 continue
-            df_60m = df_60m.dropna()
+            
             df_60m = df_60m.dropna()
 
             if len(df_60m) < 22:
