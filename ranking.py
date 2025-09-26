@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-ranking.py - Módulo de Escaneo y Ranking de Mercado v2.3.0
+ranking.py - Módulo de Escaneo y Ranking de Mercado v2.4.0
 ---------------------------------------------------------------------
 Este módulo es responsable de analizar un universo de activos financieros,
 calcular indicadores técnicos clave y rankearlos para identificar las
 mejores oportunidades de trading.
 
-Diseño Robusto y Profesional:
-- Obtención de datos a prueba de fallos con reintentos y backoff.
-- Cálculo de indicadores de grado industrial, robusto contra NaNs y errores.
-- Análisis tolerante a fallos para garantizar que el pipeline siempre se complete.
-- Configuración flexible a través de variables de entorno.
-- Lógica clara y modular para fácil mantenimiento.
+NOVEDAD: Ahora devuelve la información completa de los 50 mejores
+candidatos para permitir una validación externa más profunda.
 """
 import os
 import time
@@ -39,7 +35,7 @@ MIN_DOLLAR_VOL20 = float(os.getenv("MIN_DOLLAR_VOL20", "5000000.0"))  # $5M
 FUTURES_LIQ_WHITELIST = {"GC=F", "CL=F"}
 
 # ==============================================================================
-# 2. LÓGICA DE DATOS (UNIVERSO Y DESCARGA)
+# 2. LÓGICA DE DATOS
 # ==============================================================================
 def _series1d(col: pd.Series or pd.DataFrame) -> pd.Series:
     """
@@ -62,7 +58,7 @@ def get_universe() -> List[str]:
         tickers = [t.strip().upper() for t in custom_universe.replace(",", " ").split() if t]
         log.info(f"Using custom universe of {len(tickers)} tickers from ENV.")
         return tickers
-
+    
     etfs_core = ["SPY","QQQ","IWM","DIA","VTI","VOO","IVV","VTV","VOE","VUG","VGT","VHT","VFH","VNQ","XLC","XLK","XLY","XLP","XLV","XLI","XLB","XLRE","XLU","XLF","XLE","SOXX","SMH","XME","GDX","GDXJ","IBB","XBI","IYR","IYT","XRT","XAR","XTL","GLD","SLV","DBC","DBA","USO","UNG","TLT","IEF","SHY","LQD","HYG","URA","TAN","OIH","XHB","ITB"]
     megacaps = ["AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","TSLA","AVGO","ADBE","CSCO","CRM","NFLX","AMD","INTC","QCOM","TXN","MU","AMAT","ASML","JPM","BAC","WFC","GS","MS","BLK","C","V","MA","AXP","INTU","XOM","CVX","COP","SLB","EOG","PSX","UNH","JNJ","LLY","ABBV","MRK","PFE","TMO","DHR","HD","LOW","COST","WMT","TGT","NKE","SBUX","MCD","BKNG","CAT","DE","BA","GE","HON","UPS","FDX","MMM","ORCL","SAP","PEP","KO","PG","CL","KHC","MDLZ","DIS","CMCSA","T","VZ"]
     growth_mid = ["NOW","PANW","SNOW","NET","ZS","DDOG","SHOP","SQ","PYPL","UBER","LYFT","WBD"]
@@ -97,7 +93,7 @@ def download_with_retries(ticker: str, retries: int = 3, **kwargs) -> Optional[p
     return None
 
 # ==============================================================================
-# 3. CÁLCULO DE INDICADORES TÉCNICOS
+# 3. CÁLCULO DE INDICADORES
 # ==============================================================================
 def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
@@ -113,10 +109,6 @@ def _atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     return _rma(tr, length)
 
 def _adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    """
-    Implementación de ADX de grado industrial, robusta y a prueba de fallos.
-    Garantiza una salida de una sola columna (pd.Series).
-    """
     high  = _series1d(df['High'])
     low   = _series1d(df['Low'])
     close = _series1d(df['Close'])
@@ -127,11 +119,7 @@ def _adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
     plus_dm  = pd.Series(np.where((move_up  > move_down) & (move_up  > 0), move_up,  0.0), index=df.index)
     minus_dm = pd.Series(np.where((move_down > move_up)   & (move_down > 0), move_down, 0.0), index=df.index)
 
-    tr = pd.concat([
-        high - low,
-        (high - close.shift(1)).abs(),
-        (low - close.shift(1)).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
     
     atr = _rma(tr, length)
     plus_di = 100 * (_rma(plus_dm, length) / atr.replace(0, np.nan))
@@ -145,7 +133,6 @@ def _adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
     return adx
 
 def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Añade todos los indicadores necesarios al DataFrame."""
     df_copy = df.copy()
     close = _series1d(df_copy["Close"])
     vol   = _series1d(df_copy["Volume"])
@@ -160,9 +147,6 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 # 4. LÓGICA DE ANÁLISIS Y RANKING
 # ==============================================================================
 def analyze_ticker(ticker: str, df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Analiza un único ticker y devuelve un diccionario con sus métricas.
-    """
     try:
         if len(df) < 100:
             return {"ticker": ticker, "reason_excluded": "too_few_rows"}
@@ -171,35 +155,24 @@ def analyze_ticker(ticker: str, df: pd.DataFrame) -> Dict[str, Any]:
         latest = enriched_df.iloc[-1]
         
         dollar_vol = latest.get('DollarVol20', 0)
-        dollar_vol = 0 if pd.isna(dollar_vol) else dollar_vol
-
-        is_liquid = dollar_vol > MIN_DOLLAR_VOL20 or ticker in FUTURES_LIQ_WHITELIST
+        is_liquid = (pd.notna(dollar_vol) and dollar_vol > MIN_DOLLAR_VOL20) or ticker in FUTURES_LIQ_WHITELIST
         if not is_liquid:
             return {"ticker": ticker, "reason_excluded": "illiquid"}
 
-        if pd.isna(latest['EMA20']) or pd.isna(latest['EMA50']) or pd.isna(latest['MOM63']) or pd.isna(latest['ADX14']):
+        required_indicators = ['EMA20', 'EMA50', 'MOM63', 'ADX14']
+        if any(pd.isna(latest[ind]) for ind in required_indicators):
             return {"ticker": ticker, "reason_excluded": "indicator_nan"}
 
         long_trend = latest['EMA20'] > latest['EMA50'] and latest['MOM63'] > 0
         short_trend = latest['EMA20'] < latest['EMA50'] and latest['MOM63'] < 0
-
         if not long_trend and not short_trend:
              return {"ticker": ticker, "reason_excluded": "no_clear_trend"}
 
         is_strict = latest['ADX14'] > MIN_ADX
         side = "long" if long_trend else "short"
-        
         score = latest['ADX14'] * abs(latest['MOM63'])
 
-        return {
-            "ticker": ticker,
-            "side": side,
-            "score": score if pd.notna(score) else 0.0,
-            "is_strict": is_strict,
-            "adx": latest['ADX14'],
-            "last_close": float(_series1d(df['Close']).iloc[-1]),
-            "atr14": float(_atr(df).iloc[-1])
-        }
+        return {"ticker": ticker, "side": side, "score": score if pd.notna(score) else 0.0, "is_strict": is_strict}
     except Exception as e:
         log.error(f"Analysis failed for {ticker}: {e}", exc_info=False)
         return {"ticker": ticker, "reason_excluded": "analysis_error"}
@@ -208,60 +181,40 @@ def analyze_ticker(ticker: str, df: pd.DataFrame) -> Dict[str, Any]:
 # 5. PIPELINE PRINCIPAL
 # ==============================================================================
 def run_full_pipeline(**kwargs) -> Dict[str, Any]:
-    """
-    Orquesta todo el proceso: obtener universo, descargar datos, analizar y rankear.
-    """
     t_start = time.time()
     universe = get_universe()
     log.info(f"Starting ranking pipeline for {len(universe)} tickers.")
     
     all_results = []
     fetched_count = 0
-    
     for ticker in universe:
         df = download_with_retries(ticker, period="2y", interval="1d", auto_adjust=False)
         if df is None:
             all_results.append({"ticker": ticker, "reason_excluded": "download_failed"})
             continue
-        
         fetched_count += 1
-        analysis_result = analyze_ticker(ticker, df)
-        if analysis_result:
-            all_results.append(analysis_result)
+        all_results.append(analyze_ticker(ticker, df))
 
     candidates = [r for r in all_results if "score" in r]
-    excluded_count = len(all_results) - len(candidates)
-    
-    strict_candidates = sorted([c for c in candidates if c.get('is_strict')], key=lambda x: x.get('score', 0), reverse=True)
-    relaxed_candidates = sorted([c for c in candidates if not c.get('is_strict')], key=lambda x: x.get('score', 0), reverse=True)
+    strict = sorted([c for c in candidates if c.get('is_strict')], key=lambda x: x.get('score', 0), reverse=True)
+    relaxed = sorted([c for c in candidates if not c.get('is_strict')], key=lambda x: x.get('score', 0), reverse=True)
 
-    top3_factors = strict_candidates[:3]
-    
-    top50_symbols = [c['ticker'] for c in strict_candidates]
-    for c in relaxed_candidates:
-        if len(top50_symbols) < 50 and c['ticker'] not in top50_symbols:
-            top50_symbols.append(c['ticker'])
+    top50_candidates = strict + [r for r in relaxed if r['ticker'] not in {s['ticker'] for s in strict}]
+    top50_candidates = top50_candidates[:50]
     
     t_elapsed = round(time.time() - t_start, 2)
-    log.info(f"Pipeline finished in {t_elapsed}s. Found {len(strict_candidates)} strict candidates.")
+    log.info(f"Pipeline finished in {t_elapsed}s. Found {len(strict)} strict candidates.")
 
     return {
-        "ok": True,
-        "took_s": t_elapsed,
-        "as_of": datetime.now(timezone.utc).isoformat(),
-        "top50": top50_symbols[:50],
-        "top3_factors": top3_factors,
+        "ok": True, "took_s": t_elapsed, "as_of": datetime.now(timezone.utc).isoformat(),
+        "top50_candidates": top50_candidates, # <<-- CAMBIO CLAVE: Se devuelve la lista completa
         "diag": {
-            "universe_count": len(universe),
-            "fetched_count": fetched_count,
-            "excluded_count": excluded_count,
-            "strict_candidates_count": len(strict_candidates),
-            "relaxed_candidates_count": len(relaxed_candidates),
+            "universe_count": len(universe), "fetched_count": fetched_count,
+            "excluded_count": len(all_results) - len(candidates),
+            "strict_candidates_count": len(strict), "relaxed_candidates_count": len(relaxed),
         }
     }
 
-# --- Bloque de Ejecución para Pruebas Locales ---
 if __name__ == "__main__":
-    log.info("Running local test of the ranking pipeline...")
     result = run_full_pipeline()
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2, ensure_ascii=False))
