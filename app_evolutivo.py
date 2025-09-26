@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-app_evolutivo.py - Orquestador con Validación Profesional v4.3.0
+app_evolutivo.py - Orquestador con Validación Profesional v4.4.0
 ---------------------------------------------------------------------
 Este módulo implementa una lógica de validación de señales de nivel
 profesional sobre los 50 MEJORES candidatos del ranking.
 
 NUEVA LÓGICA DE TRABAJO:
 1.  Obtiene los 50 mejores candidatos del motor de `ranking.py`.
-2.  Itera sobre estos 50 y somete a cada uno al "Checklist de Despegue".
-3.  De todos los que PASAN la validación, los ordena por el mejor
+2.  Descarga todos los datos intradía necesarios en una única llamada masiva.
+3.  Itera sobre los 50 candidatos y los somete al "Checklist de Despegue".
+4.  De todos los que PASAN la validación, los ordena por el mejor
     ratio riesgo/beneficio y selecciona los 3 MEJORES.
-4.  Estos "Tres Finales" son los que se guardan y notifican.
+5.  Estos "Tres Finales" son los que se guardan y notifican.
 """
 import os
 import time
@@ -79,18 +80,34 @@ def update_signal_in_db(signal: Dict):
         log.error(f"Failed to update signal {signal_id} in Redis: {e}")
 
 # ==============================================================================
-# 3. LÓGICA DE VALIDACIÓN DE SEÑALES PROFESIONAL
+# 3. LÓGICA DE VALIDACIÓN DE SEÑALES PROFESIONAL (OPTIMIZADA)
 # ==============================================================================
 def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
     """
-    Toma una lista de candidatos y los somete a un checklist de validación
-    de breakout de nivel profesional usando datos de 60 minutos.
+    Toma una lista de candidatos y los valida de forma masiva y eficiente
+    usando datos de 60 minutos.
     """
     validated_signals = []
     if not candidates:
         return validated_signals
 
     log.info(f"Starting professional validation for up to {len(candidates)} candidates...")
+    
+    symbols_to_validate = [c["ticker"] for c in candidates if "ticker" in c]
+    if not symbols_to_validate:
+        return validated_signals
+
+    # --- OPTIMIZACIÓN CLAVE: Descarga masiva de datos ---
+    df_bulk_60m = ranking.download_with_retries(
+        ticker=" ".join(symbols_to_validate),
+        period="60d",
+        interval="60m"
+    )
+
+    if df_bulk_60m is None or df_bulk_60m.empty:
+        log.error("Failed to download bulk 60m data for validation. Aborting phase.")
+        return validated_signals
+
     for i, cand in enumerate(candidates):
         symbol = cand.get("ticker")
         side = cand.get("side")
@@ -99,13 +116,16 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
         
         log.info(f"({i+1}/{len(candidates)}) Validating {symbol} ({side})...")
         try:
-            # 1. OBTENER DATOS INTRADÍA
-            df_60m = ranking.download_with_retries(symbol, period="60d", interval="60m")
-            if df_60m is None or len(df_60m) < 22: # Minimo para EMA21 + velas de pivot
-                log.warning(f"[{symbol}] Insufficient 60m data for validation. Skipping.")
+            # Seleccionar los datos del ticker actual desde el DataFrame masivo
+            df_60m = df_bulk_60m.loc[:, (slice(None), symbol)]
+            df_60m.columns = df_60m.columns.droplevel(1) # Aplanar MultiIndex
+            df_60m = df_60m.dropna() # Eliminar filas con NaNs que impiden el cálculo
+
+            if len(df_60m) < 22:
+                log.warning(f"[{symbol}] Insufficient 60m data after cleaning. Skipping.")
                 continue
 
-            # 2. CALCULAR INDICADORES INTRADÍA
+            # CALCULAR INDICADORES INTRADÍA
             df_60m['EMA8'] = ranking._ema(df_60m['Close'], 8)
             df_60m['EMA21'] = ranking._ema(df_60m['Close'], 21)
             df_60m['ATR14'] = ranking._atr(df_60m, 14)
@@ -114,12 +134,11 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
             latest = df_60m.iloc[-1]
             price, atr = latest['Close'], latest['ATR14']
             
-            required_values = [price, atr, latest['EMA8'], latest['EMA21'], latest['AvgVol20']]
-            if any(pd.isna(v) for v in required_values):
+            if any(pd.isna(v) for v in [price, atr, latest['EMA8'], latest['EMA21'], latest['AvgVol20']]):
                 log.warning(f"[{symbol}] Indicators have NaN values. Skipping.")
                 continue
 
-            # 3. CHECKLIST DE VALIDACIÓN DE BREAKOUT
+            # CHECKLIST DE VALIDACIÓN DE BREAKOUT
             if side == 'long':
                 pivot_level = df_60m['High'].iloc[-6:-1].max()
                 price_ok = price > pivot_level
@@ -135,7 +154,6 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
 
             log.info(f"[{symbol}] Checklist | Price OK: {price_ok}, Volume OK: {volume_ok}, Trend OK: {trend_ok}, Extension OK: {extension_ok}")
 
-            # 4. APROBAR SEÑAL SI TODO ES CORRECTO
             if price_ok and volume_ok and trend_ok and extension_ok:
                 sl = price - 1.2 * atr if side == "long" else price + 1.2 * atr
                 tp1 = price + 1.0 * atr if side == "long" else price - 1.0 * atr
@@ -157,7 +175,7 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
 # ==============================================================================
 # 4. ORQUESTADOR Y API
 # ==============================================================================
-app = FastAPI(title="App Evolutivo - Sistema Profesional", version="4.3.0")
+app = FastAPI(title="App Evolutivo - Sistema Profesional", version="4.4.0")
 
 def send_new_signal_notification(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Notifica sobre la creación de NUEVAS señales de alta calidad."""
@@ -192,13 +210,10 @@ def run_discovery_pipeline() -> Dict:
     if not ranking_payload.get("ok"):
         raise HTTPException(status_code=500, detail="Ranking pipeline failed")
     
-    # 1. Obtener los 50 mejores candidatos del motor de ranking
     top50_candidates = ranking_payload.get("top50_candidates", [])
     
-    # 2. Validar la lista completa de candidatos
     validated_signals = validate_and_build_signals(top50_candidates)
     
-    # 3. Seleccionar los 3 mejores de los validados, ordenados por RR
     final_top_3 = sorted(validated_signals, key=lambda x: x['risk_reward_ratio'], reverse=True)[:3]
     
     if final_top_3:
@@ -233,9 +248,7 @@ def run_full_pipeline_endpoint(token: Optional[str] = Query(default=None)):
     
     t_start = time.time()
     try:
-        # En un sistema completo, la fase de monitoreo podría ir aquí.
-        # run_monitoring_phase() 
-        discovery_results = run_discovery_phase()
+        discovery_results = run_discovery_pipeline()
         t_elapsed = round(time.time() - t_start, 2)
         log.info(f"Full pipeline finished in {t_elapsed}s.")
 
