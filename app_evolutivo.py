@@ -204,7 +204,8 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
     df_bulk_60m = ranking.download_with_retries(
         ticker=" ".join(symbols_to_validate), # CORRECCIÓN CRÍTICA: Usar 'ticker' en singular
         period="60d",
-        interval="60m"
+        interval="60m",
+        group_by="ticker"  # <-- GARANTIZA MultiIndex para la descarga masiva
     )
     # Normalizar una sola vez el layout del bulk
     df_bulk_60m = _normalize_bulk_ticker_price(df_bulk_60m, set(symbols_to_validate), log)
