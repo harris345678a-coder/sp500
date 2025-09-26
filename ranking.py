@@ -73,7 +73,7 @@ def download_with_retries(ticker: str, retries: int = 3, **kwargs) -> Optional[p
     """
     for i in range(retries):
         try:
-            df = yf.download(ticker, group_by="ticker", auto_adjust=False, progress=False, **kwargs)
+            df = yf.download(ticker, progress=False, **{"group_by": "ticker", "auto_adjust": False, **kwargs})
             if not df.empty:
                 # yfinance a veces devuelve MultiIndex aun para 1 solo ticker, lo aplanamos.
                 if isinstance(df.columns, pd.MultiIndex):
