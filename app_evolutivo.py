@@ -320,17 +320,17 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
                 volume_ok = latest['Volume'] > latest['AvgVol20']
                 trend_ok = latest['EMA8'] < latest['EMA21']
                 extension_ok = (latest['EMA21'] - price) < (1.5 * atr)
-        log.info(f"[{symbol}] Checklist | Price OK: {price_ok}, Volume OK: {volume_ok}, Trend OK: {trend_ok}, Extension OK: {extension_ok}")
+            log.info(f"[{symbol}] Checklist | Price OK: {price_ok}, Volume OK: {volume_ok}, Trend OK: {trend_ok}, Extension OK: {extension_ok}")
 
-        stats["total"] += 1
-        if not price_ok:
-            stats["price"] += 1
-        if not volume_ok:
-            stats["volume"] += 1
-        if not trend_ok:
-            stats["trend"] += 1
-        if not extension_ok:
-            stats["extension"] += 1
+            stats["total"] += 1
+            if not price_ok:
+                stats["price"] += 1
+            if not volume_ok:
+                stats["volume"] += 1
+            if not trend_ok:
+                stats["trend"] += 1
+            if not extension_ok:
+                stats["extension"] += 1
 
             if price_ok and volume_ok and trend_ok and extension_ok:
                 sl = price - 1.2 * atr if side == "long" else price + 1.2 * atr
