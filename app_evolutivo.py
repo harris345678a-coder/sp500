@@ -225,21 +225,21 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
     Toma una lista de candidatos y los valida de forma masiva y eficiente
     usando datos de 60 minutos.
     """
-        stats = {"total": 0, "price": 0, "volume": 0, "trend": 0, "extension": 0}
-validated_signals = []
+    stats = {"total": 0, "price": 0, "volume": 0, "trend": 0, "extension": 0}
+    validated_signals = []
     if not candidates:
-    log.info("Checklist fails: %s", stats)
-    return validated_signals
+        log.info("Checklist fails: %s", stats)
+        return validated_signals
 
     log.info(f"Starting professional validation for up to {len(candidates)} candidates...")
     
     # --- DESCARGA MASIVA 60m ROBUSTA ---
     symbols_to_validate = [c["ticker"] for c in candidates if "ticker" in c]
+    symbols_to_validate = _apply_aliases_and_dedup(symbols_to_validate)
     if not symbols_to_validate:
         return validated_signals
 
-    tickers_str = " ".join(set(symbols_to_validate))
-    df_bulk_60m = None
+    tickers_str = " ".join(symbols_to_validate)
     
     # INTENTO 1: wrapper con 'ticker' posicional y group_by="ticker"
     try:
