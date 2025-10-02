@@ -175,6 +175,20 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 REDIS_URL = os.getenv("REDIS_URL")
 ACTIVE_SIGNALS_KEY = "evolutivo:active_signals"
+# --- Alias y deduplicación de símbolos equivalentes (p. ej., GOOG -> GOOGL) ---
+ALIASES = {
+    "GOOG": "GOOGL",
+}
+def _apply_aliases_and_dedup(symbols):
+    seen = set()
+    out = []
+    for s in symbols:
+        t = ALIASES.get(s, s)
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
 
 # ==============================================================================
 # 2. LÓGICA DE ESTADO (Redis)
@@ -211,9 +225,11 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
     Toma una lista de candidatos y los valida de forma masiva y eficiente
     usando datos de 60 minutos.
     """
-    validated_signals = []
+        stats = {"total": 0, "price": 0, "volume": 0, "trend": 0, "extension": 0}
+validated_signals = []
     if not candidates:
-        return validated_signals
+    log.info("Checklist fails: %s", stats)
+    return validated_signals
 
     log.info(f"Starting professional validation for up to {len(candidates)} candidates...")
     
@@ -258,9 +274,8 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
     if df_bulk_60m is None or df_bulk_60m.empty:
         log.error("Failed to download bulk 60m data for validation. Aborting phase.")
         return validated_signals
-
     for i, cand in enumerate(candidates):
-        symbol = cand.get("ticker")
+        symbol = ALIASES.get(cand.get("ticker"), cand.get("ticker"))
         side = cand.get("side")
         if not symbol or not side:
             continue
@@ -305,8 +320,17 @@ def validate_and_build_signals(candidates: List[Dict]) -> List[Dict]:
                 volume_ok = latest['Volume'] > latest['AvgVol20']
                 trend_ok = latest['EMA8'] < latest['EMA21']
                 extension_ok = (latest['EMA21'] - price) < (1.5 * atr)
+        log.info(f"[{symbol}] Checklist | Price OK: {price_ok}, Volume OK: {volume_ok}, Trend OK: {trend_ok}, Extension OK: {extension_ok}")
 
-            log.info(f"[{symbol}] Checklist | Price OK: {price_ok}, Volume OK: {volume_ok}, Trend OK: {trend_ok}, Extension OK: {extension_ok}")
+        stats["total"] += 1
+        if not price_ok:
+            stats["price"] += 1
+        if not volume_ok:
+            stats["volume"] += 1
+        if not trend_ok:
+            stats["trend"] += 1
+        if not extension_ok:
+            stats["extension"] += 1
 
             if price_ok and volume_ok and trend_ok and extension_ok:
                 sl = price - 1.2 * atr if side == "long" else price + 1.2 * atr

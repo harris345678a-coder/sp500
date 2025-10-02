@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ranking.py - Módulo de Escaneo y Ranking de Mercado v2.4.0
+ranking.py - Módulo de Escaneo y Ranking de Mercado v2.4.1
 ---------------------------------------------------------------------
 Este módulo es responsable de analizar un universo de activos financieros,
 calcular indicadores técnicos clave y rankearlos para identificar las
@@ -8,12 +8,16 @@ mejores oportunidades de trading.
 
 NOVEDAD: Ahora devuelve la información completa de los 50 mejores
 candidatos para permitir una validación externa más profunda.
+
+Cambios en v2.4.1:
+- (1) Descarga diaria robusta con `repair=True` y reintentos de período/fechas (descartando el ticker si no hay datos).
+- (4A) Normalización de alias de tickers (p. ej., GOOG -> GOOGL) y deduplicación ordenada.
 """
 import os
 import time
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 from typing import List, Dict, Any, Optional
 
 import numpy as np
@@ -34,6 +38,11 @@ MIN_ADX = float(os.getenv("MIN_ADX", "15.0"))
 MIN_DOLLAR_VOL20 = float(os.getenv("MIN_DOLLAR_VOL20", "5000000.0"))  # $5M
 FUTURES_LIQ_WHITELIST = {"GC=F", "CL=F"}
 
+# --- Alias para deduplicar tickers equivalentes ---
+ALIASES = {
+    "GOOG": "GOOGL",  # Mantener solo uno de los dos
+}
+
 # ==============================================================================
 # 2. LÓGICA DE DATOS
 # ==============================================================================
@@ -48,6 +57,13 @@ def _series1d(col: pd.Series or pd.DataFrame) -> pd.Series:
         col = col.iloc[:, 0]
     return pd.to_numeric(col, errors="coerce")
 
+def _apply_aliases_and_dedup(tickers: List[str]) -> List[str]:
+    """Aplica alias (p. ej., GOOG -> GOOGL) y deduplica preservando el orden."""
+    mapped = [ALIASES.get(t.strip().upper(), t.strip().upper()) for t in tickers if t]
+    seen = set()
+    ordered_unique = [t for t in mapped if not (t in seen or seen.add(t))]
+    return ordered_unique
+
 def get_universe() -> List[str]:
     """
     Define y devuelve el universo de tickers a analizar.
@@ -55,30 +71,36 @@ def get_universe() -> List[str]:
     """
     custom_universe = os.getenv("UNIVERSE_TICKERS", "").strip()
     if custom_universe:
-        tickers = [t.strip().upper() for t in custom_universe.replace(",", " ").split() if t]
-        log.info(f"Using custom universe of {len(tickers)} tickers from ENV.")
+        raw = [t.strip().upper() for t in custom_universe.replace(",", " ").split() if t]
+        tickers = _apply_aliases_and_dedup(raw)
+        log.info(f"Using custom universe of {len(tickers)} tickers from ENV (after alias/dedup).")
         return tickers
     
     etfs_core = ["SPY","QQQ","IWM","DIA","VTI","VOO","IVV","VTV","VOE","VUG","VGT","VHT","VFH","VNQ","XLC","XLK","XLY","XLP","XLV","XLI","XLB","XLRE","XLU","XLF","XLE","SOXX","SMH","XME","GDX","GDXJ","IBB","XBI","IYR","IYT","XRT","XAR","XTL","GLD","SLV","DBC","DBA","USO","UNG","TLT","IEF","SHY","LQD","HYG","URA","TAN","OIH","XHB","ITB"]
     megacaps = ["AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","TSLA","AVGO","ADBE","CSCO","CRM","NFLX","AMD","INTC","QCOM","TXN","MU","AMAT","ASML","JPM","BAC","WFC","GS","MS","BLK","C","V","MA","AXP","INTU","XOM","CVX","COP","SLB","EOG","PSX","UNH","JNJ","LLY","ABBV","MRK","PFE","TMO","DHR","HD","LOW","COST","WMT","TGT","NKE","SBUX","MCD","BKNG","CAT","DE","BA","GE","HON","UPS","FDX","MMM","ORCL","SAP","PEP","KO","PG","CL","KHC","MDLZ","DIS","CMCSA","T","VZ"]
     growth_mid = ["NOW","PANW","SNOW","NET","ZS","DDOG","SHOP","SQ","PYPL","UBER","LYFT","WBD"]
     futures = ["GC=F", "CL=F"]
-    
-    seen = set()
-    return [t for t in etfs_core + megacaps + growth_mid + futures if not (t in seen or seen.add(t))]
+
+    raw_universe = etfs_core + megacaps + growth_mid + futures
+    tickers = _apply_aliases_and_dedup(raw_universe)
+    return tickers
 
 def download_with_retries(ticker: str, retries: int = 3, **kwargs) -> Optional[pd.DataFrame]:
     """
     Descarga datos de yfinance con reintentos y backoff exponencial.
+    Normaliza columnas cuando yfinance devuelve MultiIndex para 1 ticker.
     """
     for i in range(retries):
         try:
-            df = yf.download(ticker, progress=False, **{"group_by": "ticker", "auto_adjust": False, **kwargs})
-            if not df.empty:
+            df = yf.download(
+                ticker,
+                progress=False,
+                **{"group_by": "ticker", "auto_adjust": False, **kwargs}
+            )
+            if df is not None and not df.empty:
                 # yfinance a veces devuelve MultiIndex aun para 1 solo ticker, lo aplanamos.
                 if isinstance(df.columns, pd.MultiIndex):
                     cols = df.columns
-                    # Elegir el nivel que contenga los campos de precio (p. ej., 'Close')
                     if 'Close' in cols.get_level_values(0):
                         df.columns = cols.get_level_values(0)
                     elif 'Close' in cols.get_level_values(1):
@@ -88,13 +110,10 @@ def download_with_retries(ticker: str, retries: int = 3, **kwargs) -> Optional[p
                         lvl0 = set(map(str, cols.get_level_values(0)))
                         lvl1 = set(map(str, cols.get_level_values(1)))
                         df.columns = cols.get_level_values(1) if len(_price & lvl1) > len(_price & lvl0) else cols.get_level_values(0)
-                
                 # Salvavidas: si falta 'Close' pero existe 'Adj Close', crea 'Close' sin tocar casos sanos
                 if 'Close' not in df.columns and 'Adj Close' in df.columns:
                     df['Close'] = df['Adj Close']
-
                 return df
-                
             log.warning("No data found for ticker '%s'. It might be delisted.", ticker)
             return None
         except Exception as e:
@@ -104,8 +123,39 @@ def download_with_retries(ticker: str, retries: int = 3, **kwargs) -> Optional[p
                 ticker, i + 1, retries, str(e).strip(), wait_time
             )
             time.sleep(wait_time)
-            
     log.error("Could not download '%s' after %d attempts.", ticker, retries)
+    return None
+
+def download_daily_strict(sym: str, period: str = "2y") -> Optional[pd.DataFrame]:
+    """
+    Descarga diaria robusta para ranking:
+    - Intento 1: period=2y con repair=True, threads=False
+    - Intento 2: period=365d con repair=True
+    - Intento 3: por fechas (start = hoy-730d) con repair=True
+    Si todas fallan/están vacías, devuelve None (se omite el ticker).
+    """
+    # Intento 1
+    df = download_with_retries(
+        sym, period=period, interval="1d", auto_adjust=False, repair=True, threads=False
+    )
+    if df is not None and not df.empty:
+        return df
+
+    # Intento 2
+    df = download_with_retries(
+        sym, period="365d", interval="1d", auto_adjust=False, repair=True, threads=False
+    )
+    if df is not None and not df.empty:
+        return df
+
+    # Intento 3 (por fechas)
+    start = (date.today() - timedelta(days=730)).isoformat()
+    df = download_with_retries(
+        sym, start=start, interval="1d", auto_adjust=False, repair=True, threads=False
+    )
+    if df is not None and not df.empty:
+        return df
+
     return None
 
 # ==============================================================================
@@ -204,10 +254,13 @@ def run_full_pipeline(**kwargs) -> Dict[str, Any]:
     all_results = []
     fetched_count = 0
     for ticker in universe:
-        df = download_with_retries(ticker, period="2y", interval="1d", auto_adjust=False)
-        if df is None:
+        # (1) Descarga diaria robusta; si no hay datos tras los intentos, omite el ticker
+        df = download_daily_strict(ticker, period="2y")
+        if df is None or df.empty:
+            log.warning("No data found for ticker '%s'. Skipping this run.", ticker)
             all_results.append({"ticker": ticker, "reason_excluded": "download_failed"})
             continue
+
         fetched_count += 1
         all_results.append(analyze_ticker(ticker, df))
 
@@ -223,7 +276,7 @@ def run_full_pipeline(**kwargs) -> Dict[str, Any]:
 
     return {
         "ok": True, "took_s": t_elapsed, "as_of": datetime.now(timezone.utc).isoformat(),
-        "top50_candidates": top50_candidates, # <<-- CAMBIO CLAVE: Se devuelve la lista completa
+        "top50_candidates": top50_candidates, # <<-- Se devuelve la lista completa
         "diag": {
             "universe_count": len(universe), "fetched_count": fetched_count,
             "excluded_count": len(all_results) - len(candidates),
