@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ranking.py - Módulo de Escaneo y Ranking de Mercado v2.4.1
+ranking.py - Módulo de Escaneo y Ranking de Mercado v2.4.2 (con filtro de 'side')
 ---------------------------------------------------------------------
 Este módulo es responsable de analizar un universo de activos financieros,
 calcular indicadores técnicos clave y rankearlos para identificar las
@@ -9,7 +9,8 @@ mejores oportunidades de trading.
 NOVEDAD: Ahora devuelve la información completa de los 50 mejores
 candidatos para permitir una validación externa más profunda.
 
-Cambios en v2.4.1:
+Cambios en v2.4.2:
+- Añadido parámetro opcional 'side' a run_full_pipeline para filtrar por long/short.
 - (1) Descarga diaria robusta con `repair=True` y reintentos de período/fechas (descartando el ticker si no hay datos).
 - (4A) Normalización de alias de tickers (p. ej., GOOG -> GOOGL) y deduplicación ordenada.
 """
@@ -246,7 +247,8 @@ def analyze_ticker(ticker: str, df: pd.DataFrame) -> Dict[str, Any]:
 # ==============================================================================
 # 5. PIPELINE PRINCIPAL
 # ==============================================================================
-def run_full_pipeline(**kwargs) -> Dict[str, Any]:
+# <<< CAMBIO 1: La función ahora acepta un parámetro opcional 'side' >>>
+def run_full_pipeline(side: Optional[str] = None, **kwargs) -> Dict[str, Any]:
     t_start = time.time()
     universe = get_universe()
     log.info(f"Starting ranking pipeline for {len(universe)} tickers.")
@@ -265,6 +267,13 @@ def run_full_pipeline(**kwargs) -> Dict[str, Any]:
         all_results.append(analyze_ticker(ticker, df))
 
     candidates = [r for r in all_results if "score" in r]
+
+    # <<< CAMBIO 2: Bloque de código añadido para filtrar los candidatos >>>
+    if side and side in ['long', 'short']:
+        log.info(f"Filtering candidates for side='{side}'.")
+        candidates = [c for c in candidates if c.get('side') == side]
+    # <<< FIN DE LOS CAMBIOS >>>
+
     strict = sorted([c for c in candidates if c.get('is_strict')], key=lambda x: x.get('score', 0), reverse=True)
     relaxed = sorted([c for c in candidates if not c.get('is_strict')], key=lambda x: x.get('score', 0), reverse=True)
 
